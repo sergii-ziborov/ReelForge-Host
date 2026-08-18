@@ -216,6 +216,10 @@ fn ffmpeg_ok() -> bool {
 }
 
 fn gen_color_mp4(path: &Path, secs: &str) {
+    gen_color_sized(path, secs, "320x180");
+}
+
+fn gen_color_sized(path: &Path, secs: &str, size: &str) {
     let status = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -225,7 +229,7 @@ fn gen_color_mp4(path: &Path, secs: &str) {
             "-f",
             "lavfi",
             "-i",
-            &format!("color=c=white:s=320x180:d={secs}:r=10"),
+            &format!("color=c=white:s={size}:d={secs}:r=10"),
             "-pix_fmt",
             "yuv420p",
             "-c:v",
@@ -351,12 +355,73 @@ fn bench_photo_plan(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_onnx_ingest(c: &mut Criterion) {
+    let models = reelforge_host::resolve_models_dir(None);
+    if reelforge_host::require_weights(&models).is_err() {
+        eprintln!("skip onnx ingest: no sibling weights");
+        return;
+    }
+    let scene = PathBuf::from("../ReelForge-Intelligence/target/real-video-e2e/scene.mp4");
+    if !scene.is_file() {
+        eprintln!("skip onnx ingest: no scene.mp4");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let frames = reelforge_host::extract_rgb_frames(&scene, &tmp.path().join("frames"), 2).unwrap();
+    let frames: Vec<_> = frames.into_iter().take(4).collect();
+    if frames.is_empty() {
+        return;
+    }
+
+    let mut g = c.benchmark_group("onnx");
+    g.measurement_time(Duration::from_secs(12));
+    g.sample_size(10);
+    g.bench_function("ingest_4frames_720p", |b| {
+        b.iter_custom(|iters| {
+            let mut pipe = reelforge_host::open_pipeline("bench-onnx", &models).unwrap();
+            reelforge_host::add_video_source(&mut pipe, &scene);
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = reelforge_host::ingest_frames(&mut pipe, black_box(&frames)).unwrap();
+            }
+            start.elapsed()
+        });
+    });
+    g.finish();
+}
+
+fn bench_encode_720p(c: &mut Criterion) {
+    if !ffmpeg_ok() {
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let video = tmp.path().join("src720.mp4");
+    gen_color_sized(&video, "1", "1280x720");
+    let mut g = c.benchmark_group("ffmpeg");
+    g.measurement_time(Duration::from_secs(8));
+    g.sample_size(10);
+    g.bench_function("run_graph_encode_1s_720p", |b| {
+        b.iter(|| {
+            let work = tempfile::tempdir().unwrap();
+            let out = work.path().join("out.mp4");
+            let graph_path = work.path().join("graph.json");
+            let graph = inline_graph(&video, &out);
+            std::fs::write(&graph_path, graph.to_json_pretty().unwrap()).unwrap();
+            let written = run_graph(&graph_path, None, Some(out.as_path())).unwrap();
+            black_box(written)
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_rewrite,
     bench_mcp,
     bench_photo_plan,
     bench_resolve_bridge,
-    bench_ffmpeg_host
+    bench_ffmpeg_host,
+    bench_encode_720p,
+    bench_onnx_ingest
 );
 criterion_main!(benches);

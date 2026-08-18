@@ -26,7 +26,16 @@ reelforge-host privacy-except \
   --video scene.mp4 \
   --photo alice.jpg \
   --output out.mp4 \
-  --work-dir ./work
+  --work-dir ./work \
+  --sample-fps 2 \
+  --max-frames 30
+
+# detect+reid FPS only (no photo / encode)
+reelforge-host ingest --video scene.mp4 --sample-fps 2 --max-frames 6
+
+# live camera (Windows dshow) or synthetic
+reelforge-host ingest --video cam --live-secs 3
+reelforge-host ingest --video "lavfi:testsrc=size=640x360:rate=10" --live-secs 2
 ```
 
 1. ffmpeg frames (RGB + pts)
@@ -86,7 +95,7 @@ This slice is **video + reference photo → freeze identity → blur everyone el
 
 Measured with Criterion on a Windows development host, **release** profile (`cargo bench --bench host`). Times are midpoints of Criterion `[lo mid hi]`. Re-run on your machine for CI gates.
 
-These are **Host orchestrator** numbers: rewrite, MCP, package→graph, ffmpeg probe/extract, tiny encode. They are **not** ONNX detect/re-id FPS (no weights in this repo).
+Two layers. **Orchestrator** (Criterion, no models). **Vision+encode** (release wall-clock on this Windows host, YOLOv8n + OSNet via tract CPU, 1280×720 two-person scene).
 
 | Workload | N / input | Time (approx.) |
 | --- | --- | ---: |
@@ -101,13 +110,27 @@ These are **Host orchestrator** numbers: rewrite, MCP, package→graph, ffmpeg p
 | `ffprobe` | 1 s 320×180 | **~34 ms** |
 | extract RGB @ 5 fps | 1 s clip | **~68 ms** |
 | `run_graph` encode + gaussian ROI | 1 s 320×180 | **~290 ms** |
+| `run_graph` encode + gaussian ROI | 1 s **1280×720** | **~310 ms** |
+
+**Vision + encode (release, tract CPU, 1280×720, 2 people, 6 sampled frames):**
+
+| Phase | Time | Notes |
+| --- | ---: | --- |
+| extract @ 2 fps | **174 ms** | skip-frame vs 10 fps source |
+| enroll photo | **424 ms** | OSNet |
+| ingest detect+track+embed | **7.2 s** | **~0.83 FPS** |
+| search Accept | **479 ms** | score 1.000 |
+| compile / package / graph | **46 ms** | Intelligence |
+| encode 3 s 720p | **4.7 s** | ~0.64× realtime |
+| **e2e privacy-except** | **13.5 s** | |
+
+vs Fluendo **~22 FPS** detect+reid+anonymize on MX550 GPU — we lose ~25× on ingest (CPU tract, no skip-inside-frame, no CUDA). Skip-frame (`--sample-fps`) is the Host lever, not a faster detector.
 
 Notes:
 
 - Rewrite is essentially free. MCP JSON dominates (~50× the pure function).
-- `resolve_bridge` includes VisionIndex load, mask-package write, Intelligence freeze, and graph JSON — still tens of milliseconds, not encode-bound.
-- Encode of a 1 s QCIF-ish clip is ~0.3 s wall (~3× realtime at 320×180). 1080p / ONNX ingest is a different budget (see Fluendo’s **~22 FPS** detect+reid+anonymize on MX550 — that is *their* published number, not this crate).
-- Azure / CaseGuard publish **job minutes**, not microbenchmarks (CaseGuard: ~6 min AI BWC vs ~1 h Premiere, their comparison). Not comparable to Host’s local graph path.
+- `resolve_bridge` / compile (~46 ms) is not the bottleneck. Ingest + encode are.
+- Azure / CaseGuard publish **job minutes**, not microbenchmarks.
 
 ```bash
 cargo bench --bench host

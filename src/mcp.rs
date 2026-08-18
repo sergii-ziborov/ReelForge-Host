@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 MCP for the host process. Not the Intelligence compiler catalog.
 
 use crate::compile::{photo_binding, resolve_bridge};
-use crate::decode::{extract_rgb_frames, probe_video};
+use crate::decode::{extract_rgb_frames, materialize_video, probe_video};
 use crate::encode::run_graph;
 use crate::error::{HostError, Result};
 use crate::privacy::{PrivacyExceptOpts, privacy_except};
@@ -201,8 +201,14 @@ fn ingest_video(svc: &mut HostService, args: &Value) -> Result<Value> {
         .and_then(Value::as_u64)
         .unwrap_or(5)
         .max(1) as u32;
+    let live_secs = args.get("live_secs").and_then(Value::as_f64).unwrap_or(3.0);
+    let max_frames = args.get("max_frames").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let video = materialize_video(&video, &work, live_secs)?;
     let info = probe_video(&video)?;
-    let frames = extract_rgb_frames(&video, &work.join("frames"), fps)?;
+    let mut frames = extract_rgb_frames(&video, &work.join("frames"), fps)?;
+    if max_frames > 0 && frames.len() > max_frames as usize {
+        frames.truncate(max_frames as usize);
+    }
     let pipe = svc.ensure_pipe()?;
     add_video_source(pipe, &video);
     let tracks = ingest_frames(pipe, &frames)?;
@@ -305,6 +311,8 @@ fn except(args: &Value) -> Result<Value> {
             .and_then(Value::as_u64)
             .unwrap_or(5)
             .max(1) as u32,
+        max_frames: args.get("max_frames").and_then(Value::as_u64).unwrap_or(0) as u32,
+        live_secs: args.get("live_secs").and_then(Value::as_f64).unwrap_or(3.0),
     };
     let out = privacy_except(&opts)?;
     Ok(serde_json::to_value(out)?)

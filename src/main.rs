@@ -4,8 +4,8 @@
 
 use clap::{Parser, Subcommand};
 use reelforge_host::{
-    HostService, PrivacyExceptOpts, dispatch, handle_jsonrpc, list_methods, privacy_except,
-    resolve_models_dir,
+    HostService, PrivacyExceptOpts, dispatch, handle_jsonrpc, ingest_only, list_methods,
+    privacy_except, resolve_models_dir,
 };
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
@@ -59,9 +59,36 @@ enum Commands {
         /// ONNX cache. Default: `.sightloom-models` or sibling SightLoom cache.
         #[arg(long)]
         models_dir: Option<PathBuf>,
-        /// Extracted frames per second.
+        /// Extracted frames per second (skip-frame vs source).
         #[arg(long, default_value_t = 5)]
         sample_fps: u32,
+        /// Cap frames after extract (`0` = all).
+        #[arg(long, default_value_t = 0)]
+        max_frames: u32,
+        /// Seconds to grab when `--video cam` / `lavfi:`.
+        #[arg(long, default_value_t = 3.0)]
+        live_secs: f64,
+    },
+    /// Detect+track+embed only — prints ingest FPS (no photo, no encode).
+    Ingest {
+        /// File, `cam`, or `lavfi:testsrc=size=640x360:rate=10`.
+        #[arg(long)]
+        video: PathBuf,
+        /// Scratch directory.
+        #[arg(long, default_value = "work")]
+        work_dir: PathBuf,
+        /// ONNX cache.
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
+        /// Sample fps.
+        #[arg(long, default_value_t = 5)]
+        sample_fps: u32,
+        /// Cap frames (`0` = all).
+        #[arg(long, default_value_t = 0)]
+        max_frames: u32,
+        /// Live grab seconds.
+        #[arg(long, default_value_t = 3.0)]
+        live_secs: f64,
     },
 }
 
@@ -103,6 +130,8 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
             work_dir,
             models_dir,
             sample_fps,
+            max_frames,
+            live_secs,
         } => {
             let models_dir = resolve_models_dir(models_dir.as_deref());
             eprintln!("models: {}", models_dir.display());
@@ -113,7 +142,30 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
                 work_dir,
                 models_dir,
                 sample_fps,
+                max_frames,
+                live_secs,
             })?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        Commands::Ingest {
+            video,
+            work_dir,
+            models_dir,
+            sample_fps,
+            max_frames,
+            live_secs,
+        } => {
+            let models_dir = resolve_models_dir(models_dir.as_deref());
+            eprintln!("models: {}", models_dir.display());
+            let result = ingest_only(
+                &video,
+                &work_dir,
+                &models_dir,
+                sample_fps,
+                max_frames,
+                live_secs,
+            )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }

@@ -153,3 +153,177 @@ pub fn extract_rgb_frames(video: &Path, out_dir: &Path, sample_fps: u32) -> Resu
     }
     Ok(frames)
 }
+
+/// True when `--video cam` / `live` should grab a camera.
+#[must_use]
+pub fn is_live_token(src: &str) -> bool {
+    matches!(
+        src.trim().to_ascii_lowercase().as_str(),
+        "cam" | "camera" | "live"
+    )
+}
+
+/// True when `--video lavfi:...` is a synthetic ffmpeg source.
+#[must_use]
+pub fn is_lavfi_token(src: &str) -> bool {
+    src.trim().starts_with("lavfi:")
+}
+
+/// Grab `secs` of live/synthetic video into `dest` (mp4).
+///
+/// * `cam` / `live` / `camera` — first DirectShow video device (Windows)
+/// * `lavfi:...` — ffmpeg lavfi graph (tests / no webcam)
+///
+/// # Errors
+///
+/// No camera, ffmpeg failure.
+pub fn grab_source(src: &str, dest: &Path, secs: f64) -> Result<()> {
+    let secs = secs.max(0.2);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if is_lavfi_token(src) {
+        let filter = src.trim()[6..].trim();
+        if filter.is_empty() {
+            return Err(HostError::Ffmpeg("lavfi: empty filter".into()));
+        }
+        return run_ffmpeg_grab(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                filter,
+                "-t",
+                &format!("{secs:.2}"),
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "23",
+                "-an",
+                "-y",
+            ],
+            dest,
+        );
+    }
+    if !is_live_token(src) {
+        return Err(HostError::Ffmpeg(format!(
+            "not a live source: {src} (use cam / live / lavfi:...)"
+        )));
+    }
+    let device = first_dshow_video()?;
+    run_ffmpeg_grab(
+        &[
+            "-f",
+            "dshow",
+            "-rtbufsize",
+            "100M",
+            "-i",
+            &format!("video={device}"),
+            "-t",
+            &format!("{secs:.2}"),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "23",
+            "-an",
+            "-y",
+        ],
+        dest,
+    )
+}
+
+/// Resolve `cam` / `lavfi:` to a real file; files pass through.
+///
+/// # Errors
+///
+/// Grab / missing file.
+pub fn materialize_video(
+    src: &Path,
+    work_dir: &Path,
+    live_secs: f64,
+) -> Result<std::path::PathBuf> {
+    let token = src.to_string_lossy();
+    if is_live_token(&token) || is_lavfi_token(&token) {
+        let dest = work_dir.join("live.mp4");
+        grab_source(&token, &dest, live_secs)?;
+        return Ok(dest);
+    }
+    if !src.is_file() {
+        return Err(HostError::Ffmpeg(format!(
+            "video not found: {} (or use cam / lavfi:testsrc=size=640x360:rate=10)",
+            src.display()
+        )));
+    }
+    Ok(src.to_path_buf())
+}
+
+fn run_ffmpeg_grab(args: &[&str], dest: &Path) -> Result<()> {
+    let status = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(args)
+        .arg(dest)
+        .status()
+        .map_err(|e| HostError::Ffmpeg(format!("ffmpeg grab spawn: {e}")))?;
+    if !status.success() {
+        return Err(HostError::Ffmpeg(format!("ffmpeg grab failed ({status})")));
+    }
+    if !dest.is_file() {
+        return Err(HostError::Ffmpeg("ffmpeg grab wrote no file".into()));
+    }
+    Ok(())
+}
+
+fn first_dshow_video() -> Result<String> {
+    let out = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
+        .output()
+        .map_err(|e| HostError::Ffmpeg(format!("dshow list spawn: {e}")))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let mut in_video = false;
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("directshow video") {
+            in_video = true;
+            continue;
+        }
+        if lower.contains("directshow audio") {
+            in_video = false;
+            continue;
+        }
+        if in_video && let Some(name) = quoted_device(line) {
+            return Ok(name);
+        }
+    }
+    Err(HostError::Ffmpeg(
+        "no DirectShow video device (plug in a camera, or use lavfi:testsrc=size=640x360:rate=10)"
+            .into(),
+    ))
+}
+
+fn quoted_device(line: &str) -> Option<String> {
+    let start = line.find('"')?;
+    let rest = &line[start + 1..];
+    let end = rest.find('"')?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
