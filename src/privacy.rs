@@ -5,8 +5,8 @@ use crate::decode::{extract_rgb_frames, probe_video};
 use crate::encode::run_graph;
 use crate::error::Result;
 use crate::vision::{
-    add_video_source, enroll_photo, ingest_frames, open_pipeline, require_accept, save_package,
-    search_photo,
+    add_video_source, enroll_photo, finalize_identities, ingest_frames, open_pipeline,
+    require_accept, save_package, search_photo,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -61,11 +61,17 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     })?;
     std::fs::create_dir_all(&opts.work_dir)?;
     let _info = probe_video(&opts.video)?;
+    eprintln!(
+        "extract frames @ {} fps from {}",
+        opts.sample_fps.max(1),
+        opts.video.display()
+    );
     let frames = extract_rgb_frames(
         &opts.video,
         &opts.work_dir.join("frames"),
         opts.sample_fps.max(1),
     )?;
+    eprintln!("extracted {} frames", frames.len());
 
     let mut pipe = open_pipeline("privacy-except", &opts.models_dir)?;
     add_video_source(&mut pipe, &opts.video);
@@ -76,9 +82,23 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     let photo_box = [0.0, 0.0, decoded.width as f32, decoded.height as f32];
 
     let enrolled = enroll_photo(&mut pipe, &photo_bytes)?;
-    let _ = ingest_frames(&mut pipe, &frames)?;
+    eprintln!("enrolled photo subject={enrolled}");
+    let tracks = ingest_frames(&mut pipe, &frames)?;
+    eprintln!("ingested frames={} peak_tracks={tracks}", frames.len());
     let hits = search_photo(&mut pipe, &photo_bytes, 3)?;
+    for h in &hits {
+        eprintln!(
+            "search hit subject={} score={:.3} {}",
+            h.subject_id, h.score, h.decision
+        );
+    }
     let subject_id = require_accept(&hits)?;
+    let last_pts = frames
+        .last()
+        .and_then(|f| sightloom::core::MediaTime::new(f.ticks, f.timescale).ok())
+        .ok_or_else(|| crate::error::HostError::message("no frames for identity resolve"))?;
+    let (appearances, subjects) = finalize_identities(&mut pipe, subject_id, last_pts)?;
+    eprintln!("memory appearances={appearances} subjects={subjects} allowed={subject_id}");
     let _ = enrolled;
 
     let package = opts.work_dir.join("vision_index");

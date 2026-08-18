@@ -4,8 +4,8 @@
 
 use clap::{Parser, Subcommand};
 use reelforge_host::{
-    DEFAULT_MODELS_DIR, HostService, PrivacyExceptOpts, dispatch, handle_jsonrpc, list_methods,
-    privacy_except,
+    HostService, PrivacyExceptOpts, dispatch, handle_jsonrpc, list_methods, privacy_except,
+    resolve_models_dir,
 };
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
@@ -56,9 +56,9 @@ enum Commands {
         /// Scratch directory.
         #[arg(long, default_value = "work")]
         work_dir: PathBuf,
-        /// ONNX cache (person_detect.onnx + person_reid.onnx).
-        #[arg(long, default_value = DEFAULT_MODELS_DIR)]
-        models_dir: PathBuf,
+        /// ONNX cache. Default: `.sightloom-models` or sibling SightLoom cache.
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
         /// Extracted frames per second.
         #[arg(long, default_value_t = 5)]
         sample_fps: u32,
@@ -104,6 +104,8 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
             models_dir,
             sample_fps,
         } => {
+            let models_dir = resolve_models_dir(models_dir.as_deref());
+            eprintln!("models: {}", models_dir.display());
             let result = privacy_except(&PrivacyExceptOpts {
                 video,
                 photo,

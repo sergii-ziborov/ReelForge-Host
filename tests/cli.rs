@@ -7,6 +7,19 @@ fn bin() -> &'static str {
 }
 
 #[test]
+fn resolve_models_dir_finds_sibling_sightloom_cache() {
+    let dir = reelforge_host::resolve_models_dir(None);
+    let ready = reelforge_host::require_weights(&dir);
+    if ready.is_err() {
+        eprintln!("skip: no sibling SightLoom/.sightloom-models on this checkout");
+        return;
+    }
+    let paths = ready.unwrap();
+    assert!(paths.detect.is_file());
+    assert!(paths.reid.is_file());
+}
+
+#[test]
 fn version_and_methods() {
     let out = Command::new(bin()).arg("version").output().unwrap();
     assert!(out.status.success(), "{out:?}");

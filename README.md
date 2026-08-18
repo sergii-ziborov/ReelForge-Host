@@ -39,14 +39,14 @@ reelforge-host privacy-except \
 
 If photo search is not **Accept**, the process stops. It does not guess a subject.
 
-Missing ONNX weights → **exit 2** (CI-friendly):
+Missing ONNX weights → **exit 2** (CI-friendly). Host does not vendor models. It looks in:
 
-```text
-.sightloom-models/person_detect.onnx
-.sightloom-models/person_reid.onnx
-```
+1. `--models-dir` / MCP `models_dir`
+2. `REELFORGE_MODELS` / `SIGHTLOOM_MODELS`
+3. `./.sightloom-models`
+4. sibling `../SightLoom/.sightloom-models` (`yolov8n.onnx` + `person_reid.onnx`)
 
-Weights are never committed.
+SightLoom owns the ONNX loaders; this process only picks the cache and runs the pipeline.
 
 ## MCP
 

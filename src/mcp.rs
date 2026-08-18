@@ -4,7 +4,6 @@ use crate::compile::{photo_binding, resolve_bridge};
 use crate::decode::{extract_rgb_frames, probe_video};
 use crate::encode::run_graph;
 use crate::error::{HostError, Result};
-use crate::models::DEFAULT_MODELS_DIR;
 use crate::privacy::{PrivacyExceptOpts, privacy_except};
 use crate::vision::{
     add_video_source, enroll_photo, ingest_frames, open_pipeline, require_accept, save_package,
@@ -52,7 +51,7 @@ impl HostService {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            models_dir: PathBuf::from(DEFAULT_MODELS_DIR),
+            models_dir: crate::models::resolve_models_dir(None),
             work_dir: PathBuf::from("work"),
             pipe: None,
             last_package: None,
@@ -298,7 +297,9 @@ fn except(args: &Value) -> Result<Value> {
         photo: arg_path(args, "photo")?,
         output: arg_path(args, "output")?,
         work_dir: opt_path(args, "work_dir", || PathBuf::from("work")),
-        models_dir: opt_path(args, "models_dir", || PathBuf::from(DEFAULT_MODELS_DIR)),
+        models_dir: opt_path(args, "models_dir", || {
+            crate::models::resolve_models_dir(None)
+        }),
         sample_fps: args
             .get("sample_fps")
             .and_then(Value::as_u64)
