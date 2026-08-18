@@ -2,7 +2,7 @@
 
 use crate::error::{HostError, Result};
 use reelforge_intelligence_core::{
-    BridgeOptions, IntelligenceService, MaskRequest, SelectorBinding, SemanticEdit,
+    BridgeOptions, IntelligenceService, MaskRequest, RedactionKind, SelectorBinding, SemanticEdit,
     SemanticEditPlan, SubjectSelector, UncertaintyPolicy, rewrite_selectors,
 };
 use reelforge_intelligence_sightloom::{export_and_pin_mask_package, load_package};
@@ -44,6 +44,16 @@ pub fn photo_except_plan(
     plan
 }
 
+/// Parse `gaussian` / `pixelate` / `solid`. Host default is pixelate.
+///
+/// # Errors
+///
+/// Unknown token.
+pub fn parse_redaction_kind(raw: Option<&str>) -> Result<RedactionKind> {
+    RedactionKind::parse(raw.unwrap_or("pixelate"))
+        .map_err(|e| HostError::message(e.to_string()))
+}
+
 /// Binding that maps the photo FramePick to the accepted subject id.
 #[must_use]
 pub fn photo_binding(photo: &Path, photo_box: [f32; 4], subject_id: u64) -> SelectorBinding {
@@ -66,6 +76,7 @@ pub fn resolve_bridge(
     bindings: &[SelectorBinding],
     output: Option<&Path>,
     work_dir: &Path,
+    redaction: RedactionKind,
 ) -> Result<BridgeOut> {
     let plan = if bindings.is_empty() {
         plan
@@ -126,6 +137,7 @@ pub fn resolve_bridge(
     let opts = BridgeOptions {
         output_uri: output.map(|p| p.to_string_lossy().into_owned()),
         require_approval: false,
+        redaction_kind: redaction,
         ..BridgeOptions::default()
     };
     let (report, bridged) = svc
@@ -143,4 +155,22 @@ pub fn resolve_bridge(
         mask_package_id: resolved.mask_package_id,
         subjects: resolved.resolved_subjects.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_style_defaults_to_pixelate() {
+        assert_eq!(
+            parse_redaction_kind(None).unwrap(),
+            RedactionKind::Pixelate
+        );
+        assert_eq!(
+            parse_redaction_kind(Some("gaussian")).unwrap(),
+            RedactionKind::Gaussian
+        );
+        assert!(parse_redaction_kind(Some("swirl")).is_err());
+    }
 }

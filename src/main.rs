@@ -5,7 +5,7 @@
 use clap::{Parser, Subcommand};
 use reelforge_host::{
     HostService, PrivacyExceptOpts, dispatch, handle_jsonrpc, ingest_only, list_methods,
-    privacy_except, resolve_models_dir,
+    parse_redaction_kind, privacy_except, resolve_models_dir,
 };
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
@@ -71,6 +71,9 @@ enum Commands {
         /// Embed every Nth sampled frame (track still runs each sample).
         #[arg(long, default_value_t = 1)]
         embed_every: u32,
+        /// Redaction style: `pixelate` (default), `gaussian`, `solid`.
+        #[arg(long, default_value = "pixelate")]
+        style: String,
     },
     /// Detect+track+embed only — prints ingest FPS (no photo, no encode).
     Ingest {
@@ -139,6 +142,7 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
             max_frames,
             live_secs,
             embed_every,
+            style,
         } => {
             let models_dir = resolve_models_dir(models_dir.as_deref());
             eprintln!("models: {}", models_dir.display());
@@ -152,6 +156,7 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
                 max_frames,
                 live_secs,
                 embed_every,
+                redaction: parse_redaction_kind(Some(&style))?,
             })?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())

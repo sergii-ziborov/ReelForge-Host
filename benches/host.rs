@@ -200,6 +200,7 @@ fn bench_resolve_bridge(c: &mut Criterion) {
                 black_box(std::slice::from_ref(&binding)),
                 Some(black_box(output.as_path())),
                 work.path(),
+                reelforge_intelligence_core::RedactionKind::Pixelate,
             )
             .unwrap();
             black_box(out)

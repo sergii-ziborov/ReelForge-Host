@@ -35,6 +35,30 @@ fn version_and_methods() {
 }
 
 #[test]
+fn unknown_style_fails_before_weights() {
+    let out = Command::new(bin())
+        .args([
+            "privacy-except",
+            "--video",
+            "missing.mp4",
+            "--photo",
+            "missing.jpg",
+            "--output",
+            "out.mp4",
+            "--style",
+            "swirl",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("unknown redaction style") || err.contains("swirl"),
+        "{err}"
+    );
+}
+
+#[test]
 fn privacy_except_without_weights_exits_2() {
     let dir = tempfile::tempdir().unwrap();
     let models = dir.path().join("no-models");

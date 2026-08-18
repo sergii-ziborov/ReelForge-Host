@@ -33,6 +33,8 @@ pub struct PrivacyExceptOpts {
     pub live_secs: f64,
     /// Embed every Nth sampled frame (`1` = every frame).
     pub embed_every: u32,
+    /// Privacy fill. Host default is pixelate (gaussian is recoverable).
+    pub redaction: reelforge_intelligence_core::RedactionKind,
 }
 
 /// Result of the killer path.
@@ -171,6 +173,7 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
         &[binding],
         Some(&opts.output),
         &opts.work_dir,
+        opts.redaction,
     )?;
     let compile_ms = elapsed_ms(t_compile);
 

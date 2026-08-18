@@ -18,7 +18,9 @@ mod models;
 mod privacy;
 mod vision;
 
-pub use compile::{BridgeOut, photo_binding, photo_except_plan, resolve_bridge};
+pub use compile::{
+    BridgeOut, parse_redaction_kind, photo_binding, photo_except_plan, resolve_bridge,
+};
 pub use decode::{
     RgbFrame, VideoInfo, extract_rgb_frames, grab_source, is_lavfi_token, is_live_token,
     materialize_video, probe_video,

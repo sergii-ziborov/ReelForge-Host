@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 MCP for the host process. Not the Intelligence compiler catalog.
 
-use crate::compile::{photo_binding, resolve_bridge};
+use crate::compile::{parse_redaction_kind, photo_binding, resolve_bridge};
 use crate::decode::{extract_rgb_frames, materialize_video, probe_video};
 use crate::encode::run_graph;
 use crate::error::{HostError, Result};
@@ -282,7 +282,8 @@ fn resolve(svc: &HostService, args: &Value) -> Result<Value> {
     }
     let output = args.get("output").and_then(Value::as_str).map(Path::new);
     let work = opt_path(args, "work_dir", || svc.work_dir.clone());
-    let out = resolve_bridge(&package, plan, &bindings, output, &work)?;
+    let kind = parse_redaction_kind(args.get("style").and_then(Value::as_str))?;
+    let out = resolve_bridge(&package, plan, &bindings, output, &work, kind)?;
     Ok(serde_json::to_value(out)?)
 }
 
@@ -317,6 +318,7 @@ fn except(args: &Value) -> Result<Value> {
             .get("embed_every")
             .and_then(Value::as_u64)
             .unwrap_or(1) as u32,
+        redaction: parse_redaction_kind(args.get("style").and_then(Value::as_str))?,
     };
     let out = privacy_except(&opts)?;
     Ok(serde_json::to_value(out)?)

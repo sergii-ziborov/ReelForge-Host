@@ -28,7 +28,11 @@ reelforge-host privacy-except \
   --output out.mp4 \
   --work-dir ./work \
   --sample-fps 2 \
-  --max-frames 30
+  --max-frames 30 \
+  --style pixelate          # default; gaussian is recoverable, not anonymity
+```
+
+`--style` / MCP `style`: `pixelate` (default) | `gaussian` | `solid`. Intelligence itself still defaults to gaussian so existing compiler callers do not change appearance.
 
 # detect+reid FPS only (no photo / encode)
 reelforge-host ingest --video scene.mp4 --sample-fps 2 --max-frames 6 --embed-every 2
