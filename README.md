@@ -52,6 +52,8 @@ reelforge-host ingest --video "lavfi:testsrc=size=640x360:rate=10" --live-secs 2
 
 If photo search is not **Accept**, the process stops. It does not guess a subject.
 
+Source **audio is muxed** into the output (ReelForge companion track). Silent files and live grab (`-an`) stay silent. If the source has audio and encode drops it, the process fails.
+
 Missing ONNX weights → **exit 2** (CI-friendly). Host does not vendor models. It looks in:
 
 1. `--models-dir` / MCP `models_dir`

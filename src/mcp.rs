@@ -295,7 +295,8 @@ fn run(args: &Value) -> Result<Value> {
         .map(Path::new);
     let output = args.get("output").and_then(Value::as_str).map(Path::new);
     let written = run_graph(&graph, masks, output)?;
-    Ok(json!({ "output": written }))
+    let audio = crate::decode::probe_has_audio(Path::new(&written)).unwrap_or(false);
+    Ok(json!({ "output": written, "audio": audio }))
 }
 
 fn except(args: &Value) -> Result<Value> {

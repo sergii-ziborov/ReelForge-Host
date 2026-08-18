@@ -23,7 +23,7 @@ pub use compile::{
 };
 pub use decode::{
     RgbFrame, VideoInfo, extract_rgb_frames, grab_source, is_lavfi_token, is_live_token,
-    materialize_video, probe_video,
+    materialize_video, probe_has_audio, probe_video,
 };
 pub use encode::run_graph;
 pub use error::{HostError, MISSING_WEIGHTS_EXIT, Result};
@@ -32,8 +32,8 @@ pub use models::{
     DEFAULT_MODELS_DIR, ModelPaths, missing_weights_help, require_weights, resolve_models_dir,
 };
 pub use privacy::{
-    IngestOnlyResult, PhaseTimings, PrivacyExceptOpts, PrivacyExceptResult, ingest_only,
-    photo_full_box, privacy_except,
+    AudioStatus, IngestOnlyResult, PhaseTimings, PrivacyExceptOpts, PrivacyExceptResult,
+    ingest_only, photo_full_box, privacy_except,
 };
 pub use vision::{
     PhotoHit, add_video_source, enroll_photo, ingest_frames, ingest_frames_strided, open_pipeline,

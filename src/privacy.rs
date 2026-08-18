@@ -56,6 +56,8 @@ pub struct PrivacyExceptResult {
     pub ingest_fps: f64,
     /// Phase timings in milliseconds.
     pub phases_ms: PhaseTimings,
+    /// Companion audio: `kept` or `none`. Dropped audio is an error, not a status.
+    pub audio: AudioStatus,
 }
 
 /// Wall-clock phases for the killer path (P1).
@@ -75,6 +77,16 @@ pub struct PhaseTimings {
     pub encode: u64,
     /// End-to-end.
     pub total: u64,
+}
+
+/// Companion audio status after encode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioStatus {
+    /// Source had audio and it is in the output.
+    Kept,
+    /// Source had no audio stream (live grab / silent file).
+    None,
 }
 
 /// Full pipeline. Missing weights → [`crate::HostError::MissingWeights`] (exit 2).
@@ -97,7 +109,7 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     let t0 = Instant::now();
     std::fs::create_dir_all(&opts.work_dir)?;
     let video = materialize_video(&opts.video, &opts.work_dir, opts.live_secs.max(0.2))?;
-    let _info = probe_video(&video)?;
+    let info = probe_video(&video)?;
     eprintln!(
         "extract frames @ {} fps from {} (max_frames={})",
         opts.sample_fps.max(1),
@@ -184,8 +196,19 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
         Some(&opts.output),
     )?;
     let encode_ms = elapsed_ms(t_encode);
+    let out_audio = crate::decode::probe_has_audio(Path::new(&written))?;
+    if info.has_audio && !out_audio {
+        return Err(crate::error::HostError::Encode(
+            "source has audio but encode dropped it".into(),
+        ));
+    }
+    let audio = if out_audio {
+        AudioStatus::Kept
+    } else {
+        AudioStatus::None
+    };
     let total_ms = elapsed_ms(t0);
-    eprintln!("encode {encode_ms} ms; total {total_ms} ms");
+    eprintln!("encode {encode_ms} ms; audio={audio:?}; total {total_ms} ms");
 
     Ok(PrivacyExceptResult {
         subject_id,
@@ -204,6 +227,7 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
             encode: encode_ms,
             total: total_ms,
         },
+        audio,
     })
 }
 

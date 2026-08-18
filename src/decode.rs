@@ -31,6 +31,8 @@ pub struct VideoInfo {
     pub height: u32,
     /// Container duration seconds when known.
     pub duration_secs: f64,
+    /// True when ffprobe sees an audio stream.
+    pub has_audio: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +101,34 @@ pub fn probe_video(path: &Path) -> Result<VideoInfo> {
         width,
         height,
         duration_secs,
+        has_audio: probe_has_audio(path)?,
     })
+}
+
+/// True when `path` has at least one audio stream.
+///
+/// # Errors
+///
+/// ffprobe spawn failure. Missing audio is `Ok(false)`, not an error.
+pub fn probe_has_audio(path: &Path) -> Result<bool> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| HostError::Ffmpeg(format!("ffprobe audio spawn: {e}")))?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
 /// Extract RGB frames at `sample_fps` into `out_dir` (`frame_000000.png` …).
