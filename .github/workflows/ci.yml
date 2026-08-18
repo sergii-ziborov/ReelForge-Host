@@ -35,6 +35,11 @@ jobs:
         with:
           repository: sergii-ziborov/ReelForge-Intelligence
           path: ReelForge-Intelligence
+      - name: checkout Capture sibling
+        uses: actions/checkout@v4
+        with:
+          repository: sergii-ziborov/ReelForge-Capture
+          path: ReelForge-Capture
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97

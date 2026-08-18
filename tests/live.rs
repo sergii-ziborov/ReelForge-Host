@@ -1,12 +1,15 @@
 //! Live / lavfi grab without a webcam.
 
-use reelforge_host::{grab_source, is_lavfi_token, is_live_token, materialize_video};
+use reelforge_host::{
+    grab_source, is_capture_token, is_lavfi_token, is_live_token, materialize_video,
+};
 
 #[test]
 fn tokens() {
     assert!(is_live_token("cam"));
     assert!(is_live_token("LIVE"));
     assert!(is_lavfi_token("lavfi:testsrc=size=64x64:rate=10"));
+    assert!(is_capture_token("capture:ses_1"));
     assert!(!is_live_token("scene.mp4"));
 }
 

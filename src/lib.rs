@@ -9,6 +9,7 @@
     clippy::needless_pass_by_value
 )]
 
+mod capture;
 mod compile;
 mod decode;
 mod encode;
@@ -19,6 +20,10 @@ mod models;
 mod privacy;
 mod vision;
 
+pub use capture::{
+    capture_input, is_capture_project_file, is_capture_session_dir, is_capture_token,
+    materialize_capture, resolve_capture_videos,
+};
 pub use compile::{
     BridgeOut, parse_redaction_kind, photo_binding, photo_except_plan, resolve_bridge,
 };

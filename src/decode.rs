@@ -281,9 +281,12 @@ pub fn materialize_video(
         grab_source(&token, &dest, live_secs)?;
         return Ok(dest);
     }
+    if let Some(cap) = crate::capture::capture_input(src) {
+        return crate::capture::materialize_capture(&cap, work_dir);
+    }
     if !src.is_file() {
         return Err(HostError::Ffmpeg(format!(
-            "video not found: {} (or use cam / lavfi:testsrc=size=640x360:rate=10)",
+            "video not found: {} (or use cam / lavfi:… / Capture session dir / project.json)",
             src.display()
         )));
     }

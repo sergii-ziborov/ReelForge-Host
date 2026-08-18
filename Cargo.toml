@@ -22,6 +22,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 reelforge = { path = "../ReelForge/crates/reelforge" }
+reelforge-capture-core = { path = "../ReelForge-Capture/crates/reelforge-capture-core" }
+reelforge-capture-schema = { path = "../ReelForge-Capture/crates/reelforge-capture-schema" }
+reelforge-capture-store = { path = "../ReelForge-Capture/crates/reelforge-capture-store" }
 reelforge-intelligence-core = { path = "../ReelForge-Intelligence/crates/reelforge-intelligence-core" }
 reelforge-intelligence-sightloom = { path = "../ReelForge-Intelligence/crates/reelforge-intelligence-sightloom" }
 sightloom = { path = "../SightLoom/crates/sightloom", default-features = false, features = ["std"] }

@@ -14,7 +14,7 @@ One process over the four libraries. **Talk to this MCP, not four.**
         ├── SightLoom (+ sightloom-host)   detect / enroll / search / VisionIndex
         ├── Intelligence                   rewrite_selectors → resolve → graph
         ├── ReelForge                      run_render_graph / encode
-        └── Capture                        not used (screen grab only)
+        └── Capture                        session / CaptureProject → committed media URIs
 ```
 
 Host does **not** invent VisionIndex, SemanticEditPlan, or RenderGraph. It calls the siblings.
@@ -40,7 +40,14 @@ reelforge-host ingest --video scene.mp4 --sample-fps 2 --max-frames 6 --embed-ev
 # live camera (Windows dshow) or synthetic
 reelforge-host ingest --video cam --live-secs 3
 reelforge-host ingest --video "lavfi:testsrc=size=640x360:rate=10" --live-secs 2
+
+# Capture session or project (committed segments only — never glob the tail)
+reelforge-host ingest --video ./sessions/ses_abc
+reelforge-host ingest --video project.json
+reelforge-host privacy-except --video capture:ses_abc --photo alice.jpg --output out.mp4
 ```
+
+Capture **grabs**. Host **ingests** `media[].uri` / committed session segments. Unfinished `segments/` files are ignored.
 
 1. ffmpeg frames (RGB + pts)
 2. `HostPipeline.ingest_frame`

@@ -1277,6 +1277,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "reelforge-capture-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "reelforge-capture-schema"
+version = "0.1.0"
+dependencies = [
+ "reelforge-capture-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "reelforge-capture-store"
+version = "0.1.0"
+dependencies = [
+ "reelforge-capture-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "reelforge-compose"
 version = "0.2.1"
 dependencies = [
@@ -1307,6 +1334,9 @@ dependencies = [
  "clap",
  "criterion",
  "reelforge",
+ "reelforge-capture-core",
+ "reelforge-capture-schema",
+ "reelforge-capture-store",
  "reelforge-intelligence-core",
  "reelforge-intelligence-sightloom",
  "serde",
