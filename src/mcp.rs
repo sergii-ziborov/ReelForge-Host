@@ -313,6 +313,10 @@ fn except(args: &Value) -> Result<Value> {
             .max(1) as u32,
         max_frames: args.get("max_frames").and_then(Value::as_u64).unwrap_or(0) as u32,
         live_secs: args.get("live_secs").and_then(Value::as_f64).unwrap_or(3.0),
+        embed_every: args
+            .get("embed_every")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32,
     };
     let out = privacy_except(&opts)?;
     Ok(serde_json::to_value(out)?)

@@ -68,6 +68,9 @@ enum Commands {
         /// Seconds to grab when `--video cam` / `lavfi:`.
         #[arg(long, default_value_t = 3.0)]
         live_secs: f64,
+        /// Embed every Nth sampled frame (track still runs each sample).
+        #[arg(long, default_value_t = 1)]
+        embed_every: u32,
     },
     /// Detect+track+embed only — prints ingest FPS (no photo, no encode).
     Ingest {
@@ -89,6 +92,9 @@ enum Commands {
         /// Live grab seconds.
         #[arg(long, default_value_t = 3.0)]
         live_secs: f64,
+        /// Embed every Nth sampled frame.
+        #[arg(long, default_value_t = 1)]
+        embed_every: u32,
     },
 }
 
@@ -132,6 +138,7 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
             sample_fps,
             max_frames,
             live_secs,
+            embed_every,
         } => {
             let models_dir = resolve_models_dir(models_dir.as_deref());
             eprintln!("models: {}", models_dir.display());
@@ -144,6 +151,7 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
                 sample_fps,
                 max_frames,
                 live_secs,
+                embed_every,
             })?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
@@ -155,6 +163,7 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
             sample_fps,
             max_frames,
             live_secs,
+            embed_every,
         } => {
             let models_dir = resolve_models_dir(models_dir.as_deref());
             eprintln!("models: {}", models_dir.display());
@@ -165,6 +174,7 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
                 sample_fps,
                 max_frames,
                 live_secs,
+                embed_every,
             )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())

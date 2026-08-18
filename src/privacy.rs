@@ -5,7 +5,7 @@ use crate::decode::{extract_rgb_frames, materialize_video, probe_video};
 use crate::encode::run_graph;
 use crate::error::Result;
 use crate::vision::{
-    add_video_source, enroll_photo, finalize_identities, ingest_frames, open_pipeline,
+    add_video_source, enroll_photo, finalize_identities, ingest_frames_strided, open_pipeline,
     require_accept, save_package, search_photo,
 };
 use serde::Serialize;
@@ -31,6 +31,8 @@ pub struct PrivacyExceptOpts {
     pub max_frames: u32,
     /// Seconds to grab when `--video cam` / `lavfi:`.
     pub live_secs: f64,
+    /// Embed every Nth sampled frame (`1` = every frame).
+    pub embed_every: u32,
 }
 
 /// Result of the killer path.
@@ -126,7 +128,7 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     eprintln!("enrolled photo subject={enrolled} in {enroll_ms} ms");
 
     let t_ingest = Instant::now();
-    let tracks = ingest_frames(&mut pipe, &frames)?;
+    let tracks = ingest_frames_strided(&mut pipe, &frames, opts.embed_every)?;
     let ingest_ms = elapsed_ms(t_ingest);
     let ingest_fps = if ingest_ms == 0 {
         0.0
@@ -235,6 +237,7 @@ pub fn ingest_only(
     sample_fps: u32,
     max_frames: u32,
     live_secs: f64,
+    embed_every: u32,
 ) -> Result<IngestOnlyResult> {
     let _ = crate::models::require_weights(models_dir).map_err(|e| {
         if let crate::error::HostError::MissingWeights(msg) = e {
@@ -258,7 +261,7 @@ pub fn ingest_only(
     let mut pipe = open_pipeline("ingest-only", models_dir)?;
     add_video_source(&mut pipe, &video);
     let t0 = Instant::now();
-    let peak_tracks = ingest_frames(&mut pipe, &frames)?;
+    let peak_tracks = ingest_frames_strided(&mut pipe, &frames, embed_every)?;
     let ingest_ms = elapsed_ms(t0);
     let ingest_fps = if ingest_ms == 0 {
         0.0

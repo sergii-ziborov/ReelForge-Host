@@ -55,6 +55,20 @@ pub fn add_video_source(pipe: &mut HostPipeline, video: &Path) {
 ///
 /// Detector / tracker / embed.
 pub fn ingest_frames(pipe: &mut HostPipeline, frames: &[RgbFrame]) -> Result<usize> {
+    ingest_frames_strided(pipe, frames, 1)
+}
+
+/// Detect+track every frame; embed every `embed_every`th (P1 skip).
+///
+/// # Errors
+///
+/// Detector / tracker / embed.
+pub fn ingest_frames_strided(
+    pipe: &mut HostPipeline,
+    frames: &[RgbFrame],
+    embed_every: u32,
+) -> Result<usize> {
+    let stride = embed_every.max(1);
     let mut tracks = 0_usize;
     for frame in frames {
         let view = FrameView::new(
@@ -67,9 +81,13 @@ pub fn ingest_frames(pipe: &mut HostPipeline, frames: &[RgbFrame]) -> Result<usi
         let pts = MediaTime::new(frame.ticks, frame.timescale)
             .map_err(|e| HostError::SightLoom(format!("pts: {e:?}")))?;
         let stamp = FrameStamp::new(SourceId(1), frame.index, pts, None);
-        let tracked = pipe
-            .ingest_frame(stamp, &view)
-            .map_err(|e| HostError::SightLoom(e.to_string()))?;
+        let tracked = if frame.index.is_multiple_of(u64::from(stride)) {
+            pipe.ingest_frame(stamp, &view)
+                .map_err(|e| HostError::SightLoom(e.to_string()))?
+        } else {
+            pipe.ingest_frame_track_only(stamp, &view)
+                .map_err(|e| HostError::SightLoom(e.to_string()))?
+        };
         tracks = tracks.max(tracked.len());
     }
     Ok(tracks)

@@ -31,7 +31,7 @@ reelforge-host privacy-except \
   --max-frames 30
 
 # detect+reid FPS only (no photo / encode)
-reelforge-host ingest --video scene.mp4 --sample-fps 2 --max-frames 6
+reelforge-host ingest --video scene.mp4 --sample-fps 2 --max-frames 6 --embed-every 2
 
 # live camera (Windows dshow) or synthetic
 reelforge-host ingest --video cam --live-secs 3
@@ -118,7 +118,8 @@ Two layers. **Orchestrator** (Criterion, no models). **Vision+encode** (release 
 | --- | ---: | --- |
 | extract @ 2 fps | **174 ms** | skip-frame vs 10 fps source |
 | enroll photo | **424 ms** | OSNet |
-| ingest detect+track+embed | **7.2 s** | **~0.83 FPS** |
+| ingest detect+track+embed | **7.2 s** | **~0.83 FPS** (`embed-every 1`) |
+| ingest `--embed-every 2` | **4.7 s** | **~1.27 FPS** (track every sample, embed half) |
 | search Accept | **479 ms** | score 1.000 |
 | compile / package / graph | **46 ms** | Intelligence |
 | encode 3 s 720p | **4.7 s** | ~0.64× realtime |

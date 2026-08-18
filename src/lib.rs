@@ -34,6 +34,6 @@ pub use privacy::{
     photo_full_box, privacy_except,
 };
 pub use vision::{
-    PhotoHit, add_video_source, enroll_photo, ingest_frames, open_pipeline, require_accept,
-    search_photo,
+    PhotoHit, add_video_source, enroll_photo, ingest_frames, ingest_frames_strided, open_pipeline,
+    require_accept, search_photo,
 };
