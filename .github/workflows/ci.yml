@@ -48,6 +48,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+      - name: bench compile
+        run: cargo bench --bench host --no-run
       - name: cli smoke
         run: |
           cargo run -- version

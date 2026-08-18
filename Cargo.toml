@@ -30,6 +30,11 @@ sightloom-index = { path = "../SightLoom/crates/sightloom-index", default-featur
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "host"
+harness = false
 
 [lints.rust]
 unsafe_code = "forbid"
