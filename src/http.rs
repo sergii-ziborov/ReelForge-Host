@@ -113,6 +113,10 @@ fn handle_connection(
     token: Option<&str>,
 ) -> Result<bool> {
     let req = read_request(stream)?;
+    if req.method == "OPTIONS" {
+        write_http(stream, 204, "text/plain", "")?;
+        return Ok(false);
+    }
     if req.method == "GET" && (req.path == "/" || req.path == "/health") {
         let body = json!({
             "ok": true,
@@ -298,6 +302,9 @@ fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &st
          Content-Length: {}\r\n\
          Connection: close\r\n\
          MCP-Protocol-Version: {MCP_PROTOCOL_VERSION}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type, Authorization, X-ReelForge-Token, MCP-Protocol-Version\r\n\
          \r\n",
         body.len()
     );

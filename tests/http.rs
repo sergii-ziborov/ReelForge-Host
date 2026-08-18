@@ -179,6 +179,19 @@ fn token_required() {
 }
 
 #[test]
+fn cors_preflight_allows_browser() {
+    let (addr, handle) = spawn(None);
+    let (status, _) = exchange(
+        addr,
+        &format!(
+            "OPTIONS /mcp HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://127.0.0.1:5173\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert_eq!(status, 204);
+    shutdown(addr, None, handle);
+}
+
+#[test]
 fn unknown_path_is_404() {
     let (addr, handle) = spawn(None);
     let (status, _) = post(addr, "/nope", None, "{}");

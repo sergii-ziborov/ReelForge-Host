@@ -80,7 +80,7 @@ reelforge-host serve --http 0.0.0.0:8787 --token "$REELFORGE_HOST_TOKEN"
 reelforge-host methods
 ```
 
-HTTP is the same JSON-RPC as stdio (`POST /mcp` or `POST /`). `GET /health` is a liveness probe. Non-loopback binds refuse to start without `--token` / `REELFORGE_HOST_TOKEN` (`Authorization: Bearer …` or `X-ReelForge-Token`).
+HTTP is the same JSON-RPC as stdio (`POST /mcp` or `POST /`). `GET /health` is a liveness probe. Non-loopback binds refuse to start without `--token` / `REELFORGE_HOST_TOKEN` (`Authorization: Bearer …` or `X-ReelForge-Token`). CORS is open so local Studio (Vite / egui) can call loopback Host.
 
 | Tool | Role |
 | --- | --- |
