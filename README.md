@@ -94,6 +94,8 @@ HTTP is the same JSON-RPC as stdio (`POST /mcp` or `POST /`). `GET /health` is a
 
 Intelligence compiler tools (`compile_plan`, …) are **not** proxied.
 
+**Agents** should call this process (`serve` / `serve --http`), not Intelligence and not a separate “ReelForge-MCP” repo. Surfaces (egui / Vite / mcport shim) live in [ReelForge-Studio](https://github.com/sergii-ziborov/ReelForge-Studio) and stay public. Variants, money, MCP vs hosted vs LSP: [docs/USE-CASES.md](docs/USE-CASES.md).
+
 ## Competitive landscape
 
 This slice is **video + reference photo → freeze identity → blur everyone else → encode**, as an embeddable CLI/MCP. Nearby tools solve adjacent problems.

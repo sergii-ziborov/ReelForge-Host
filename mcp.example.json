@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "reelforge-host": {
+      "command": "reelforge-host",
+      "args": ["serve"]
+    }
+  }
+}
