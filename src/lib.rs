@@ -13,6 +13,7 @@ mod compile;
 mod decode;
 mod encode;
 mod error;
+mod http;
 mod mcp;
 mod models;
 mod privacy;
@@ -27,6 +28,10 @@ pub use decode::{
 };
 pub use encode::run_graph;
 pub use error::{HostError, MISSING_WEIGHTS_EXIT, Result};
+pub use http::{
+    DEFAULT_HTTP_BIND, HttpServeOpts, is_loopback_bind, require_token_for_bind, serve_http,
+    serve_http_listener,
+};
 pub use mcp::{HostService, MCP_PROTOCOL_VERSION, METHODS, dispatch, handle_jsonrpc, list_methods};
 pub use models::{
     DEFAULT_MODELS_DIR, ModelPaths, missing_weights_help, require_weights, resolve_models_dir,

@@ -4,8 +4,9 @@
 
 use clap::{Parser, Subcommand};
 use reelforge_host::{
-    HostService, PrivacyExceptOpts, dispatch, handle_jsonrpc, ingest_only, list_methods,
-    parse_redaction_kind, privacy_except, resolve_models_dir,
+    DEFAULT_HTTP_BIND, HostService, HttpServeOpts, PrivacyExceptOpts, dispatch, handle_jsonrpc,
+    ingest_only, list_methods, parse_redaction_kind, privacy_except, require_token_for_bind,
+    resolve_models_dir, serve_http,
 };
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
@@ -40,8 +41,15 @@ enum Commands {
         #[arg(long, short = 'a', default_value = "{}")]
         args: String,
     },
-    /// JSON-RPC 2.0 MCP on stdio.
-    Serve,
+    /// JSON-RPC 2.0 MCP on stdio, or HTTP when `--http` is set.
+    Serve {
+        /// Bind HTTP (`127.0.0.1:8787` if the flag has no value). Omit for stdio.
+        #[arg(long, num_args = 0..=1, default_missing_value = DEFAULT_HTTP_BIND)]
+        http: Option<String>,
+        /// Bearer token. Required when bind is not loopback. Env `REELFORGE_HOST_TOKEN`.
+        #[arg(long, env = "REELFORGE_HOST_TOKEN")]
+        token: Option<String>,
+    },
     /// Video + photo → encode (killer path).
     PrivacyExcept {
         /// Input video.
@@ -131,7 +139,16 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
-        Commands::Serve => serve_stdio(),
+        Commands::Serve { http, token } => {
+            let token = token.filter(|t| !t.trim().is_empty());
+            match http {
+                Some(bind) => {
+                    require_token_for_bind(&bind, token.as_deref())?;
+                    serve_http(HttpServeOpts { bind, token })
+                }
+                None => serve_stdio(),
+            }
+        }
         Commands::PrivacyExcept {
             video,
             photo,

@@ -66,9 +66,14 @@ SightLoom owns the ONNX loaders; this process only picks the cache and runs the 
 ## MCP
 
 ```bash
-reelforge-host serve
+reelforge-host serve                          # stdio JSON-RPC
+reelforge-host serve --http                   # http://127.0.0.1:8787/mcp
+reelforge-host serve --http 127.0.0.1:0       # ephemeral port (printed on stderr)
+reelforge-host serve --http 0.0.0.0:8787 --token "$REELFORGE_HOST_TOKEN"
 reelforge-host methods
 ```
+
+HTTP is the same JSON-RPC as stdio (`POST /mcp` or `POST /`). `GET /health` is a liveness probe. Non-loopback binds refuse to start without `--token` / `REELFORGE_HOST_TOKEN` (`Authorization: Bearer …` or `X-ReelForge-Token`).
 
 | Tool | Role |
 | --- | --- |

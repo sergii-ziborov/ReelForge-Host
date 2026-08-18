@@ -20,6 +20,22 @@ fn resolve_models_dir_finds_sibling_sightloom_cache() {
 }
 
 #[test]
+fn serve_help_lists_http() {
+    let out = Command::new(bin())
+        .args(["serve", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("--http"), "{text}");
+    assert!(text.contains("--token"), "{text}");
+}
+
+#[test]
 fn version_and_methods() {
     let out = Command::new(bin()).arg("version").output().unwrap();
     assert!(out.status.success(), "{out:?}");
