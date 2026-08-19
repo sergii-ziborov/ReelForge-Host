@@ -44,6 +44,21 @@ fn jsonrpc_initialize_and_tools_list() {
     assert!(names.contains(&"search_photo"));
     assert!(names.contains(&"run_graph"));
     assert!(names.contains(&"privacy_except"));
+    let privacy = tools
+        .iter()
+        .find(|t| t["name"] == "privacy_except")
+        .unwrap();
+    let required = privacy["inputSchema"]["required"].as_array().unwrap();
+    for need in ["video", "photo", "output"] {
+        assert!(
+            required.iter().any(|v| v == need),
+            "privacy_except schema missing {need}: {privacy}"
+        );
+    }
+    assert_eq!(
+        privacy["inputSchema"]["properties"]["style"]["default"],
+        "pixelate"
+    );
 
     let unknown = handle_jsonrpc(
         &mut svc,

@@ -15,6 +15,7 @@ mod decode;
 mod encode;
 mod error;
 mod http;
+mod lsp;
 mod mcp;
 mod models;
 mod privacy;
@@ -36,6 +37,10 @@ pub use error::{HostError, MISSING_WEIGHTS_EXIT, Result};
 pub use http::{
     DEFAULT_HTTP_BIND, HttpServeOpts, is_loopback_bind, require_token_for_bind, serve_http,
     serve_http_listener,
+};
+pub use lsp::{
+    EDIT_TYPES, JOB_KEYS, LspCompletion, LspDiagnostic, SELECTOR_KINDS, STYLES, completions_at,
+    diagnose_text, hover_at, serve_lsp,
 };
 pub use mcp::{HostService, MCP_PROTOCOL_VERSION, METHODS, dispatch, handle_jsonrpc, list_methods};
 pub use models::{

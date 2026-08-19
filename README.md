@@ -24,7 +24,7 @@ Host does **not** invent VisionIndex, SemanticEditPlan, or RenderGraph. It calls
 ```bash
 reelforge-host privacy-except \
   --video scene.mp4 \
-  --photo alice.jpg \
+  --photo keep.jpg \
   --output out.mp4 \
   --work-dir ./work \
   --sample-fps 2 \
@@ -34,6 +34,29 @@ reelforge-host privacy-except \
 
 `--style` / MCP `style`: `pixelate` (default) | `gaussian` | `solid`. Intelligence itself still defaults to gaussian so existing compiler callers do not change appearance.
 
+### Proof
+
+Same Host job: one reference still of the person to keep → Accept → everyone else is redacted. These are **synthetic** portraits generated for the demo (not photographs of real people).
+
+Reference photo:
+
+<img src="docs/proof/keep.jpg" width="180" alt="Reference still of the person who stays sharp">
+
+| Before | After (`privacy-except`) |
+| --- | --- |
+| ![two people, both sharp](docs/proof/before.jpg) | ![left sharp, right redacted](docs/proof/after.jpg) |
+
+Pixelate (Host default, anonymity):
+
+![left sharp, right mosaic](docs/proof/after-pixelate.jpg)
+
+Cartoon stand-in of the same contract (keep one, redact the rest):
+
+![cartoon two people](docs/proof/cartoon.jpg)
+
+Walking / talking footage is a harder bar (tracks split, photo can Accept itself). That is still open. The still job above is the contract that already ships: CLI, MCP, LSP.
+
+```bash
 # detect+reid FPS only (no photo / encode)
 reelforge-host ingest --video scene.mp4 --sample-fps 2 --max-frames 6 --embed-every 2
 
@@ -44,7 +67,7 @@ reelforge-host ingest --video "lavfi:testsrc=size=640x360:rate=10" --live-secs 2
 # Capture session or project (committed segments only — never glob the tail)
 reelforge-host ingest --video ./sessions/ses_abc
 reelforge-host ingest --video project.json
-reelforge-host privacy-except --video capture:ses_abc --photo alice.jpg --output out.mp4
+reelforge-host privacy-except --video capture:ses_abc --photo keep.jpg --output out.mp4
 ```
 
 Capture **grabs**. Host **ingests** `media[].uri` / committed session segments. Unfinished `segments/` files are ignored.
@@ -73,10 +96,12 @@ SightLoom owns the ONNX loaders; this process only picks the cache and runs the 
 ## MCP
 
 ```bash
+reelforge-host privacy-except --video scene.mp4 --photo keep.jpg --output out.mp4
 reelforge-host serve                          # stdio JSON-RPC
 reelforge-host serve --http                   # http://127.0.0.1:8787/mcp
 reelforge-host serve --http 127.0.0.1:0       # ephemeral port (printed on stderr)
 reelforge-host serve --http 0.0.0.0:8787 --token "$REELFORGE_HOST_TOKEN"
+reelforge-host lsp                            # stdio LSP for job JSON / SemanticEditPlan
 reelforge-host methods
 ```
 
@@ -94,7 +119,7 @@ HTTP is the same JSON-RPC as stdio (`POST /mcp` or `POST /`). `GET /health` is a
 
 Intelligence compiler tools (`compile_plan`, …) are **not** proxied.
 
-**Agents** should call this process (`serve` / `serve --http`), not Intelligence and not a separate “ReelForge-MCP” repo. Surfaces (egui / Vite / mcport shim) live in [ReelForge-Studio](https://github.com/sergii-ziborov/ReelForge-Studio) and stay public. Variants, money, MCP vs hosted vs LSP: [docs/USE-CASES.md](docs/USE-CASES.md).
+**Agents** should call this process (`serve` / `serve --http`), not Intelligence and not a separate “ReelForge-MCP” repo. Editors use `reelforge-host lsp` for the same JSON. Surfaces (egui / Vite / mcport shim) live in [ReelForge-Studio](https://github.com/sergii-ziborov/ReelForge-Studio) and stay public. Variants, money, MCP vs hosted vs LSP: [docs/USE-CASES.md](docs/USE-CASES.md).
 
 ## Competitive landscape
 

@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use reelforge_host::{
     DEFAULT_HTTP_BIND, HostService, HttpServeOpts, PrivacyExceptOpts, dispatch, handle_jsonrpc,
     ingest_only, list_methods, parse_redaction_kind, privacy_except, require_token_for_bind,
-    resolve_models_dir, serve_http,
+    resolve_models_dir, serve_http, serve_lsp,
 };
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
@@ -41,6 +41,8 @@ enum Commands {
         #[arg(long, short = 'a', default_value = "{}")]
         args: String,
     },
+    /// Language server for Host job JSON / SemanticEditPlan (stdio LSP).
+    Lsp,
     /// JSON-RPC 2.0 MCP on stdio, or HTTP when `--http` is set.
     Serve {
         /// Bind HTTP (`127.0.0.1:8787` if the flag has no value). Omit for stdio.
@@ -139,6 +141,7 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
+        Commands::Lsp => serve_lsp(),
         Commands::Serve { http, token } => {
             let token = token.filter(|t| !t.trim().is_empty());
             match http {

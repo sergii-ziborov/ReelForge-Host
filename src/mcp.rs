@@ -159,16 +159,116 @@ pub fn dispatch(svc: &mut HostService, method: &str, args: &Value) -> Result<Val
 }
 
 fn mcp_tools() -> Vec<Value> {
-    METHODS
-        .iter()
-        .map(|name| {
+    vec![
+        tool(
+            "privacy_except",
+            "Killer path: video + photo of the one person to keep sharp. Photo search must Accept or the job fails. Default style is pixelate.",
             json!({
-                "name": name,
-                "description": format!("ReelForge Host method `{name}`"),
-                "inputSchema": { "type": "object", "additionalProperties": true }
-            })
-        })
-        .collect()
+                "type": "object",
+                "required": ["video", "photo", "output"],
+                "properties": {
+                    "video": { "type": "string", "description": "Path on the Host machine" },
+                    "photo": { "type": "string", "description": "Reference still of the allowed person" },
+                    "output": { "type": "string", "description": "Output mp4 path on the Host machine" },
+                    "style": { "type": "string", "enum": ["pixelate", "gaussian", "solid"], "default": "pixelate" },
+                    "work_dir": { "type": "string" },
+                    "models_dir": { "type": "string" },
+                    "sample_fps": { "type": "integer", "default": 5 },
+                    "max_frames": { "type": "integer", "default": 0 },
+                    "embed_every": { "type": "integer", "default": 1 }
+                }
+            }),
+        ),
+        tool(
+            "search_photo",
+            "Rank gallery hits for a still. Host never picks the nearest face. Check accepted.",
+            json!({
+                "type": "object",
+                "required": ["photo"],
+                "properties": {
+                    "photo": { "type": "string" },
+                    "top_k": { "type": "integer", "default": 3 }
+                }
+            }),
+        ),
+        tool(
+            "enroll_photo",
+            "JPEG/PNG → gallery subject id.",
+            json!({
+                "type": "object",
+                "required": ["photo"],
+                "properties": { "photo": { "type": "string" } }
+            }),
+        ),
+        tool(
+            "ingest_video",
+            "Decode + detect/track/embed + save VisionIndex package.",
+            json!({
+                "type": "object",
+                "required": ["video"],
+                "properties": {
+                    "video": { "type": "string" },
+                    "work_dir": { "type": "string" },
+                    "sample_fps": { "type": "integer", "default": 5 },
+                    "max_frames": { "type": "integer", "default": 0 }
+                }
+            }),
+        ),
+        tool(
+            "rewrite_plan",
+            "Rewrite FramePick selectors to SubjectIds using bindings.",
+            json!({
+                "type": "object",
+                "required": ["plan"],
+                "properties": {
+                    "plan": { "type": "object" },
+                    "bindings": { "type": "array" }
+                }
+            }),
+        ),
+        tool(
+            "resolve_bridge",
+            "Intelligence freeze + mask package + RenderGraph JSON.",
+            json!({
+                "type": "object",
+                "required": ["plan"],
+                "properties": {
+                    "plan": { "type": "object" },
+                    "package": { "type": "string" },
+                    "photo": { "type": "string" },
+                    "subject_id": { "type": "integer" },
+                    "output": { "type": "string" },
+                    "style": { "type": "string", "enum": ["pixelate", "gaussian", "solid"] }
+                }
+            }),
+        ),
+        tool(
+            "run_graph",
+            "Encode a compiled RenderGraph. Source audio is muxed or the job fails.",
+            json!({
+                "type": "object",
+                "required": ["graph"],
+                "properties": {
+                    "graph": { "type": "string" },
+                    "mask_package": { "type": "string" },
+                    "output": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
+            "list_methods",
+            "List Host MCP tool names. Intelligence compile_plan is not here.",
+            json!({ "type": "object", "properties": {} }),
+        ),
+    ]
+}
+
+fn tool(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema
+    })
 }
 
 fn jsonrpc_error(id: &Value, code: i64, message: impl Into<String>) -> Value {
