@@ -50,17 +50,11 @@ Pixelate (Host default, anonymity):
 
 ![left sharp, right mosaic](docs/proof/after-pixelate.jpg)
 
-Videos (the stills above are frames from these):
-
-- [after.mp4](docs/proof/after.mp4) — keep left, redact right
-- [after-pixelate.mp4](docs/proof/after-pixelate.mp4) — mosaic
-- [walk-talk-out.mp4](docs/proof/walk-talk-out.mp4) — Pexels walking clip (motion bar; currently redacts everyone, including the keep subject)
-
 Cartoon stand-in of the same contract (keep one, redact the rest):
 
 ![cartoon two people](docs/proof/cartoon.jpg)
 
-Walking / talking footage is a harder bar (tracks split, photo can Accept itself). That is still open. The still job above is the contract that already ships: CLI, MCP, LSP.
+Video demos stay off this repo until a job is approved. The contract that ships is CLI + MCP + LSP.
 
 ```bash
 # detect+reid FPS only (no photo / encode)
