@@ -50,6 +50,12 @@ Pixelate (Host default, anonymity):
 
 ![left sharp, right mosaic](docs/proof/after-pixelate.jpg)
 
+Videos (the stills above are frames from these):
+
+- [after.mp4](docs/proof/after.mp4) — keep left, redact right
+- [after-pixelate.mp4](docs/proof/after-pixelate.mp4) — mosaic
+- [walk-talk-out.mp4](docs/proof/walk-talk-out.mp4) — Pexels walking clip (motion bar; currently redacts everyone, including the keep subject)
+
 Cartoon stand-in of the same contract (keep one, redact the rest):
 
 ![cartoon two people](docs/proof/cartoon.jpg)
