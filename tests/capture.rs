@@ -1,9 +1,10 @@
 //! Capture session / project ingest — no ONNX. Uses lavfi only for concat.
 
 use reelforge::{
-    CaptureProject, CropRect, Gap, MediaRef, MediaRefId, MediaTime, Metadata, ProjectId,
-    RenderNodeKind, Retiming, Sequence, SequenceId, SourceRange, TimelineClip, TimelineClipId,
-    TimelineItem, TimelineTrack, TimelineTrackId, TrackKind, compile_project,
+    CaptureProject, CropRect, Gap, GraphRunOptions, JobState, JobStore, MediaRef, MediaRefId,
+    MediaTime, Metadata, ProjectId, RenderGraph, RenderNodeKind, Retiming, Sequence, SequenceId,
+    SourceRange, StageCache, TimelineClip, TimelineClipId, TimelineItem, TimelineTrack,
+    TimelineTrackId, TrackKind, WriteControl, compile_project, run_render_job, submit_render_job,
 };
 use reelforge_host::{extract_rgb_frames, materialize_video, probe_video, resolve_capture_videos};
 use std::path::{Path, PathBuf};
@@ -213,13 +214,7 @@ fn editorial_project_keeps_trim_crop_speed_and_both_audio_legs() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let picture = dir.path().join("picture.mp4");
-    let mic = dir.path().join("mic.wav");
-    let system = dir.path().join("system.wav");
-    lavfi_split(&picture);
-    sine_wav(&mic, "440");
-    sine_wav(&system, "880");
-    let project = edited_project(&picture, &mic, &system);
+    let project = prepared_project(dir.path());
 
     let compiled = compile_project(&project).unwrap();
     let mix_inputs = compiled
@@ -239,7 +234,86 @@ fn editorial_project_keeps_trim_crop_speed_and_both_audio_legs() {
     std::fs::write(&path, project.to_json_pretty().unwrap()).unwrap();
     let work = dir.path().join("work");
     let out = materialize_video(&path, &work, 0.3).unwrap();
-    let info = probe_video(&out).unwrap();
+    assert_editorial_contract(&out, &dir.path().join("frames"));
+}
+
+#[test]
+fn editorial_cache_and_resume_keep_the_same_contract() {
+    if !ffmpeg_ok() {
+        eprintln!("skip: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let project = prepared_project(dir.path());
+    let cached = dir.path().join("cached.mp4");
+    let graph = graph_for(&project, &cached);
+    let store = JobStore::open(dir.path().join("jobs")).unwrap();
+    let opts =
+        GraphRunOptions::new().with_cache(StageCache::open(dir.path().join("cache")).unwrap());
+    let mut job = submit_render_job(&store, &graph, &opts).unwrap();
+    run_render_job(&store, &mut job, &graph, &WriteControl::default(), &opts).unwrap();
+    assert_eq!(job.state, JobState::Done);
+    assert_editorial_contract(&cached, &dir.path().join("frames-cache"));
+    let bytes = std::fs::read(&cached).unwrap();
+    std::fs::remove_file(&cached).unwrap();
+    run_render_job(&store, &mut job, &graph, &WriteControl::default(), &opts).unwrap();
+    assert_eq!(std::fs::read(&cached).unwrap(), bytes);
+
+    let resumed = dir.path().join("resumed.mp4");
+    let again = graph_for(&project, &resumed);
+    let resume_store = JobStore::open(dir.path().join("resume-jobs")).unwrap();
+    let plain = GraphRunOptions::new();
+    let mut second = submit_render_job(&resume_store, &again, &plain).unwrap();
+    run_render_job(
+        &resume_store,
+        &mut second,
+        &again,
+        &WriteControl::default(),
+        &plain,
+    )
+    .unwrap();
+    let stamps = stage_stamps(&resume_store.stages_dir(&second.id));
+    assert!(!stamps.is_empty(), "resume needs persisted stages");
+    std::fs::remove_file(&resumed).unwrap();
+    run_render_job(
+        &resume_store,
+        &mut second,
+        &again,
+        &WriteControl::default(),
+        &plain,
+    )
+    .unwrap();
+    for (path, stamp) in &stamps {
+        let now = path.metadata().unwrap().modified().unwrap();
+        assert_eq!(
+            &now,
+            stamp,
+            "skipped stage was rewritten: {}",
+            path.display()
+        );
+    }
+    assert_editorial_contract(&resumed, &dir.path().join("frames-resume"));
+}
+
+fn prepared_project(dir: &Path) -> CaptureProject {
+    let picture = dir.join("picture.mp4");
+    let mic = dir.join("mic.wav");
+    let system = dir.join("system.wav");
+    lavfi_split(&picture);
+    sine_wav(&mic, "440");
+    sine_wav(&system, "880");
+    edited_project(&picture, &mic, &system)
+}
+
+fn graph_for(project: &CaptureProject, dest: &Path) -> RenderGraph {
+    let mut graph = compile_project(project).unwrap().graph;
+    let output = graph.outputs.first_mut().expect("compiled output");
+    output.uri = Some(dest.to_string_lossy().into_owned());
+    graph
+}
+
+fn assert_editorial_contract(path: &Path, frames_dir: &Path) {
+    let info = probe_video(path).unwrap();
     assert_eq!((info.width, info.height), (32, 32));
     assert!(
         (0.85..=1.25).contains(&info.duration_secs),
@@ -247,7 +321,7 @@ fn editorial_project_keeps_trim_crop_speed_and_both_audio_legs() {
         info.duration_secs
     );
     assert!(info.has_audio);
-    let frames = extract_rgb_frames(&out, &dir.path().join("frames"), 10).unwrap();
+    let frames = extract_rgb_frames(path, frames_dir, 10).unwrap();
     assert!(frames.len() >= 8, "frames {}", frames.len());
     let gap_px = center_rgb(&frames[0]);
     let blue_px = center_rgb(&frames[7]);
@@ -259,13 +333,30 @@ fn editorial_project_keeps_trim_crop_speed_and_both_audio_legs() {
         blue_px[2] > 150 && blue_px[0] < 80,
         "kept the blue half after the gap, got {blue_px:?}"
     );
-    let bursts = audio_bursts(&out);
+    let bursts = audio_bursts(path);
     assert!(bursts.len() >= 2, "both legs should sound, got {bursts:?}");
     assert!(bursts[0] < 0.2, "mic starts at 0, got {bursts:?}");
     assert!(
         (0.35..=0.8).contains(&bursts[1]),
         "system starts after the 0.5s gap, got {bursts:?}"
     );
+}
+
+fn stage_stamps(dir: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("stages") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("mp4") {
+            let stamp = path
+                .metadata()
+                .expect("stage meta")
+                .modified()
+                .expect("mtime");
+            found.push((path, stamp));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
 }
 
 fn center_rgb(frame: &reelforge_host::RgbFrame) -> [u8; 3] {
