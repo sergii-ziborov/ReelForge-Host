@@ -1,7 +1,9 @@
 //! Ingest Capture sessions / projects. Host does not grab the screen.
 //!
-//! Capture owns gdigrab + the session store. We only take **committed**
-//! `media[].uri` values (or `SessionStore` segments). Never glob `segments/`.
+//! Capture owns gdigrab + the session store. A session or a media-only project
+//! contributes **committed** `media[].uri` values (or `SessionStore` segments).
+//! Never glob `segments/`. A project with sequences is compiled and rendered,
+//! so trim, crop, speed, and audio tracks survive.
 
 use crate::error::{HostError, Result};
 use reelforge_capture_schema::CaptureProject;
@@ -80,10 +82,18 @@ pub fn resolve_capture_videos(src: &Path) -> Result<Vec<PathBuf>> {
 
 /// One file if a single segment; otherwise concat into `work_dir/capture.mp4`.
 ///
+/// A project file that has sequences is rendered with [`reelforge::compile_project`]
+/// instead of concatenating library files.
+///
 /// # Errors
 ///
-/// Resolve or ffmpeg concat.
+/// Resolve, compile, render, or ffmpeg concat.
 pub fn materialize_capture(src: &Path, work_dir: &Path) -> Result<PathBuf> {
+    if src.is_file()
+        && let Some(rendered) = render_timeline(src, work_dir)?
+    {
+        return Ok(rendered);
+    }
     let videos = resolve_capture_videos(src)?;
     match videos.as_slice() {
         [] => Err(HostError::message(
@@ -150,6 +160,36 @@ fn videos_from_project_file(path: &Path) -> Result<Vec<PathBuf>> {
         ));
     }
     Ok(out)
+}
+
+/// Render an editorial project. `Ok(None)` means "no sequences; use media URIs".
+fn render_timeline(path: &Path, work_dir: &Path) -> Result<Option<PathBuf>> {
+    let text = std::fs::read_to_string(path)?;
+    let Ok(project) = reelforge::CaptureProject::from_json(&text) else {
+        return Ok(None);
+    };
+    if project.sequences.is_empty() {
+        return Ok(None);
+    }
+    let compiled = reelforge::compile_project(&project)
+        .map_err(|e| HostError::message(format!("compile CaptureProject: {e}")))?;
+    std::fs::create_dir_all(work_dir)?;
+    let dest = work_dir.join("capture.mp4");
+    let mut graph = compiled.graph;
+    let Some(output) = graph.outputs.first_mut() else {
+        return Err(HostError::message("compiled CaptureProject has no output"));
+    };
+    output.uri = Some(dest.to_string_lossy().into_owned());
+    reelforge::run_render_graph_with(
+        &graph,
+        &reelforge::WriteControl::default(),
+        &reelforge::GraphRunOptions::default(),
+    )
+    .map_err(|e| HostError::message(format!("render CaptureProject: {e}")))?;
+    if !dest.is_file() || dest.metadata()?.len() == 0 {
+        return Err(HostError::message("compiled CaptureProject wrote no video"));
+    }
+    Ok(Some(dest))
 }
 
 fn abs_path(path: &Path) -> PathBuf {
