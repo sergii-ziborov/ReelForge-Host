@@ -80,7 +80,10 @@ fn concat_two_project_clips() {
     assert_eq!(resolve_capture_videos(&project).unwrap().len(), 2);
     let work = dir.path().join("work");
     let out = materialize_video(&project, &work, 0.3).unwrap();
-    assert_eq!(out.file_name().map(PathBuf::from), Some(PathBuf::from("capture.mp4")));
+    assert_eq!(
+        out.file_name().map(PathBuf::from),
+        Some(PathBuf::from("capture.mp4"))
+    );
     assert!(out.is_file());
     assert!(out.metadata().unwrap().len() > 0);
 }

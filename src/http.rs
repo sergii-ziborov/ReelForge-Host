@@ -27,10 +27,7 @@ pub struct HttpServeOpts {
 /// True when `bind` is loopback (`127.0.0.1`, `localhost`, `::1`).
 #[must_use]
 pub fn is_loopback_bind(spec: &str) -> bool {
-    matches!(
-        bind_host(spec),
-        "127.0.0.1" | "localhost" | "::1" | "[::1]"
-    )
+    matches!(bind_host(spec), "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 /// Refuse non-loopback binds without a token.
@@ -55,9 +52,8 @@ pub fn require_token_for_bind(bind: &str, token: Option<&str>) -> Result<()> {
 /// Bind, HTTP, or I/O.
 pub fn serve_http(opts: HttpServeOpts) -> Result<()> {
     require_token_for_bind(&opts.bind, opts.token.as_deref())?;
-    let listener = TcpListener::bind(&opts.bind).map_err(|e| {
-        HostError::message(format!("http bind {}: {e}", opts.bind))
-    })?;
+    let listener = TcpListener::bind(&opts.bind)
+        .map_err(|e| HostError::message(format!("http bind {}: {e}", opts.bind)))?;
     serve_http_listener(listener, opts.token)
 }
 

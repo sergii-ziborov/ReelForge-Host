@@ -37,14 +37,20 @@ fn serve_help_lists_http() {
 
 #[test]
 fn lsp_help_is_a_host_mouth() {
-    let out = Command::new(bin()).args(["lsp", "--help"]).output().unwrap();
+    let out = Command::new(bin())
+        .args(["lsp", "--help"])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{out:?}");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.to_lowercase().contains("language server") || text.contains("LSP"), "{text}");
+    assert!(
+        text.to_lowercase().contains("language server") || text.contains("LSP"),
+        "{text}"
+    );
 }
 
 #[test]

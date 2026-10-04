@@ -20,8 +20,7 @@ pub fn is_capture_token(src: &str) -> bool {
 /// Directory looks like a Capture session (manifest / WAL), not a video file.
 #[must_use]
 pub fn is_capture_session_dir(path: &Path) -> bool {
-    path.is_dir()
-        && (path.join("manifest.json").is_file() || path.join("wal.jsonl").is_file())
+    path.is_dir() && (path.join("manifest.json").is_file() || path.join("wal.jsonl").is_file())
 }
 
 /// JSON file that parses as `CaptureProject` v0/v1 with at least one video.
@@ -109,7 +108,8 @@ pub fn materialize_capture(src: &Path, work_dir: &Path) -> Result<PathBuf> {
 }
 
 fn videos_from_session(dir: &Path) -> Result<Vec<PathBuf>> {
-    let store = SessionStore::open(dir).map_err(|e| HostError::message(format!("capture session: {e}")))?;
+    let store =
+        SessionStore::open(dir).map_err(|e| HostError::message(format!("capture session: {e}")))?;
     let segs = &store.manifest().segments;
     if segs.is_empty() {
         return Err(HostError::message(
@@ -164,7 +164,10 @@ fn concat_videos(files: &[PathBuf], dest: &Path) -> Result<()> {
     let list = dest.with_file_name("capture.concat.txt");
     let mut body = String::new();
     for f in files {
-        let p = f.to_string_lossy().replace('\\', "/").replace('\'', r"'\''");
+        let p = f
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', r"'\''");
         body.push_str("file '");
         body.push_str(&p);
         body.push_str("'\n");
@@ -200,7 +203,9 @@ fn run_concat(list: &Path, dest: &Path, copy: bool) -> Result<bool> {
     if copy {
         cmd.args(["-c", "copy"]);
     } else {
-        cmd.args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-crf", "23"]);
+        cmd.args([
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-crf", "23",
+        ]);
     }
     let status = cmd
         .arg(dest)
@@ -282,7 +287,9 @@ mod tests {
             },
         )
         .unwrap();
-        let err = resolve_capture_videos(store.root()).unwrap_err().to_string();
+        let err = resolve_capture_videos(store.root())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("committed"), "{err}");
     }
 
