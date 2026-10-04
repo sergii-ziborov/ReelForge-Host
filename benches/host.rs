@@ -102,11 +102,13 @@ fn bench_mcp(c: &mut Criterion) {
                 subject_id: 2,
                 score: 0.4,
                 decision: "uncertain".into(),
+                ..PhotoHit::default()
             },
             PhotoHit {
                 subject_id: 1,
                 score: 0.91,
                 decision: "accept".into(),
+                ..PhotoHit::default()
             },
         ];
         b.iter(|| black_box(require_accept(black_box(&hits)).unwrap()));
@@ -186,7 +188,7 @@ fn bench_resolve_bridge(c: &mut Criterion) {
     let photo = PathBuf::from("alice.jpg");
     let output = tmp.path().join("out.mp4");
     let plan = photo_except_plan(&video, &photo, [0.0, 0.0, 64.0, 64.0], &output);
-    let binding = photo_binding(&photo, [0.0, 0.0, 64.0, 64.0], 1);
+    let binding = photo_binding(&photo, [0.0, 0.0, 64.0, 64.0], vec![1]);
 
     let mut g = c.benchmark_group("resolve_bridge");
     g.measurement_time(Duration::from_secs(4));
@@ -348,7 +350,7 @@ fn bench_photo_plan(c: &mut Criterion) {
                 black_box([0.0, 0.0, 864.0, 1152.0]),
                 black_box(&output),
             );
-            let bind = photo_binding(&photo, [0.0, 0.0, 864.0, 1152.0], 1);
+            let bind = photo_binding(&photo, [0.0, 0.0, 864.0, 1152.0], vec![1]);
             let out = rewrite_selectors(plan, std::slice::from_ref(&bind)).unwrap();
             black_box(out)
         });

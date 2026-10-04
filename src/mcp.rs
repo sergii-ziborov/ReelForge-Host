@@ -158,6 +158,7 @@ pub fn dispatch(svc: &mut HostService, method: &str, args: &Value) -> Result<Val
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn mcp_tools() -> Vec<Value> {
     vec![
         tool(
@@ -376,7 +377,7 @@ fn resolve(svc: &HostService, args: &Value) -> Result<Value> {
             .and_then(Value::as_u64)
             .ok_or_else(|| HostError::message("resolve_bridge: subject_id required with photo"))?;
         let box_xyxy = crate::privacy::photo_full_box(Path::new(photo))?;
-        let extra = photo_binding(Path::new(photo), box_xyxy, sid);
+        let extra = photo_binding(Path::new(photo), box_xyxy, vec![sid]);
         plan = rewrite_selectors(plan, &[extra])
             .map_err(|e| HostError::Intelligence(e.to_string()))?;
     }
@@ -415,10 +416,7 @@ fn except(args: &Value) -> Result<Value> {
             .max(1) as u32,
         max_frames: args.get("max_frames").and_then(Value::as_u64).unwrap_or(0) as u32,
         live_secs: args.get("live_secs").and_then(Value::as_f64).unwrap_or(3.0),
-        embed_every: args
-            .get("embed_every")
-            .and_then(Value::as_u64)
-            .unwrap_or(1) as u32,
+        embed_every: args.get("embed_every").and_then(Value::as_u64).unwrap_or(1) as u32,
         redaction: parse_redaction_kind(args.get("style").and_then(Value::as_str))?,
     };
     let out = privacy_except(&opts)?;

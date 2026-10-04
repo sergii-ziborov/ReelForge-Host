@@ -51,6 +51,8 @@ pub use privacy::{
     ingest_only, photo_full_box, privacy_except,
 };
 pub use vision::{
-    PhotoHit, add_video_source, enroll_photo, ingest_frames, ingest_frames_strided, open_pipeline,
-    require_accept, search_photo,
+    KeepIdentity, PhotoHit, add_video_source, best_video_accept, crop_track_boxes_to_faces,
+    enroll_photo, face_xyxy, ingest_frames, ingest_frames_strided, merge_keep_identity,
+    open_pipeline, protect_keep_geometry, require_accept, require_video_accept, search_photo,
+    search_video_tracks,
 };

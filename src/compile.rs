@@ -50,18 +50,19 @@ pub fn photo_except_plan(
 ///
 /// Unknown token.
 pub fn parse_redaction_kind(raw: Option<&str>) -> Result<RedactionKind> {
-    RedactionKind::parse(raw.unwrap_or("pixelate"))
-        .map_err(|e| HostError::message(e.to_string()))
+    RedactionKind::parse(raw.unwrap_or("pixelate")).map_err(|e| HostError::message(e.to_string()))
 }
 
-/// Binding that maps the photo FramePick to the accepted subject id.
+/// Binding that maps the photo FramePick to the accepted subject id(s).
+///
+/// Cuts fragment one person across many ids; invert must drop every fragment.
 #[must_use]
-pub fn photo_binding(photo: &Path, photo_box: [f32; 4], subject_id: u64) -> SelectorBinding {
+pub fn photo_binding(photo: &Path, photo_box: [f32; 4], ids: Vec<u64>) -> SelectorBinding {
     SelectorBinding {
         media: photo.to_string_lossy().into_owned(),
         frame_index: 0,
         box_xyxy: photo_box,
-        ids: vec![subject_id],
+        ids,
     }
 }
 
@@ -163,10 +164,7 @@ mod tests {
 
     #[test]
     fn host_style_defaults_to_pixelate() {
-        assert_eq!(
-            parse_redaction_kind(None).unwrap(),
-            RedactionKind::Pixelate
-        );
+        assert_eq!(parse_redaction_kind(None).unwrap(), RedactionKind::Pixelate);
         assert_eq!(
             parse_redaction_kind(Some("gaussian")).unwrap(),
             RedactionKind::Gaussian

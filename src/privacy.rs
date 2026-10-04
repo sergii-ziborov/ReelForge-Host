@@ -5,8 +5,8 @@ use crate::decode::{extract_rgb_frames, materialize_video, probe_video};
 use crate::encode::run_graph;
 use crate::error::Result;
 use crate::vision::{
-    add_video_source, enroll_photo, finalize_identities, ingest_frames_strided, open_pipeline,
-    require_accept, save_package, search_photo,
+    add_video_source, crop_track_boxes_to_faces, finalize_identities, ingest_frames_strided,
+    merge_keep_identity, open_pipeline, protect_keep_geometry, save_package, search_video_tracks,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -137,9 +137,9 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     let photo_box = [0.0, 0.0, decoded.width as f32, decoded.height as f32];
 
     let t_enroll = Instant::now();
-    let enrolled = enroll_photo(&mut pipe, &photo_bytes)?;
+    // Do not enroll the still first. Gallery search Accepts the JPEG itself
+    // (score 1.0) and never binds the walking person.
     let enroll_ms = elapsed_ms(t_enroll);
-    eprintln!("enrolled photo subject={enrolled} in {enroll_ms} ms");
 
     let t_ingest = Instant::now();
     let tracks = ingest_frames_strided(&mut pipe, &frames, opts.embed_every)?;
@@ -154,31 +154,43 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
         frames.len()
     );
 
-    let t_search = Instant::now();
-    let hits = search_photo(&mut pipe, &photo_bytes, 3)?;
-    for h in &hits {
-        eprintln!(
-            "search hit subject={} score={:.3} {}",
-            h.subject_id, h.score, h.decision
-        );
-    }
-    let subject_id = require_accept(&hits)?;
-    let search_ms = elapsed_ms(t_search);
-
     let last_pts = frames
         .last()
         .and_then(|f| sightloom::core::MediaTime::new(f.ticks, f.timescale).ok())
         .ok_or_else(|| crate::error::HostError::message("no frames for identity resolve"))?;
+    let t_search = Instant::now();
+    let (appearances, subjects) = finalize_identities(&mut pipe, 0, last_pts)?;
+    let hits = search_video_tracks(&mut pipe, &photo_bytes, 64)?;
+    for h in &hits {
+        eprintln!(
+            "track hit subject={} track={}:{} score={:.3} {}",
+            h.subject_id, h.source_id, h.track_id, h.score, h.decision
+        );
+    }
+    let keep = merge_keep_identity(
+        &mut pipe,
+        &hits,
+        &decoded.rgb,
+        decoded.width,
+        decoded.height,
+        &frames,
+    )?;
+    let subject_id = keep.subject_id;
+    crop_track_boxes_to_faces(&mut pipe, &keep.allowed_ids);
+    protect_keep_geometry(&mut pipe, &keep.allowed_ids);
+    let search_ms = elapsed_ms(t_search);
+    eprintln!(
+        "memory appearances={appearances} subjects={subjects} allowed={subject_id} keep_tracks={}",
+        keep.keep_tracks
+    );
+
     let t_compile = Instant::now();
-    let (appearances, subjects) = finalize_identities(&mut pipe, subject_id, last_pts)?;
-    eprintln!("memory appearances={appearances} subjects={subjects} allowed={subject_id}");
-    let _ = enrolled;
 
     let package = opts.work_dir.join("vision_index");
     save_package(&pipe, &package)?;
 
     let plan = photo_except_plan(&video, &opts.photo, photo_box, &opts.output);
-    let binding = photo_binding(&opts.photo, photo_box, subject_id);
+    let binding = photo_binding(&opts.photo, photo_box, keep.allowed_ids.clone());
     let bridged = resolve_bridge(
         &package,
         plan,
@@ -187,6 +199,11 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
         &opts.work_dir,
         opts.redaction,
     )?;
+    eprintln!(
+        "compile redact_subjects={} graph={}",
+        bridged.subjects,
+        bridged.graph_path.display()
+    );
     let compile_ms = elapsed_ms(t_compile);
 
     let t_encode = Instant::now();
@@ -282,9 +299,7 @@ pub fn ingest_only(
     if max_frames > 0 && frames.len() > max_frames as usize {
         frames.truncate(max_frames as usize);
     }
-    let (width, height) = frames
-        .first()
-        .map_or((0, 0), |f| (f.width, f.height));
+    let (width, height) = frames.first().map_or((0, 0), |f| (f.width, f.height));
     let mut pipe = open_pipeline("ingest-only", models_dir)?;
     add_video_source(&mut pipe, &video);
     let t0 = Instant::now();

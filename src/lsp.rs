@@ -82,10 +82,7 @@ pub fn serve_lsp() -> Result<()> {
     let mut stdin = stdin.lock();
     let mut stdout = io::stdout();
     let mut docs: HashMap<String, String> = HashMap::new();
-    loop {
-        let Some(msg) = read_lsp_message(&mut stdin)? else {
-            break;
-        };
+    while let Some(msg) = read_lsp_message(&mut stdin)? {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         if method == "exit" {
             break;
@@ -153,7 +150,7 @@ pub fn diagnose_text(text: &str) -> Vec<LspDiagnostic> {
 pub fn completions_at(text: &str, offset: usize) -> Vec<LspCompletion> {
     let prefix = &text[..offset.min(text.len())];
     let ctx = prefix
-        .rsplit(|c: char| c == '\n' || c == '{' || c == ',')
+        .rsplit(['\n', '{', ','])
         .next()
         .unwrap_or(prefix)
         .trim();
@@ -225,16 +222,12 @@ pub fn hover_at(text: &str, offset: usize) -> Option<String> {
         "privacy_except" => {
             "Killer path: video + photo → Accept → redact everyone except that person.".into()
         }
-        "search_photo" => {
-            "Photo search. Host refuses to guess: no Accept → no subject.".into()
-        }
+        "search_photo" => "Photo search. Host refuses to guess: no Accept → no subject.".into(),
         "blur_everyone_except" => {
             "Keep `allowed` sharp. Everyone else is redacted. FramePick must rewrite to SubjectIds."
                 .into()
         }
-        "frame_pick" => {
-            "Click/box on a still. Fail-closed: must Accept before encode.".into()
-        }
+        "frame_pick" => "Click/box on a still. Fail-closed: must Accept before encode.".into(),
         "redact_pii" => "Plates / screens / text. Missing evidence is an error.".into(),
         "video" => "Path on the Host machine. Not a browser upload.".into(),
         "photo" => "Reference still of the one person who stays sharp.".into(),
@@ -259,14 +252,14 @@ fn diagnose_job(text: &str, obj: &serde_json::Map<String, Value>) -> Vec<LspDiag
                 1,
                 format!("{key} required — Host job will not start"),
             )),
-            Some(path) if looks_like_path(path) && !Path::new(path).exists() => out.push(
-                diag_on_key(
+            Some(path) if looks_like_path(path) && !Path::new(path).exists() => {
+                out.push(diag_on_key(
                     text,
                     key,
                     1,
                     format!("{key} not found on this machine: {path}"),
-                ),
-            ),
+                ));
+            }
             Some(_) => {}
         }
     }
@@ -285,7 +278,12 @@ fn diagnose_job(text: &str, obj: &serde_json::Map<String, Value>) -> Vec<LspDiag
 
 fn diagnose_plan(text: &str, obj: &serde_json::Map<String, Value>) -> Vec<LspDiagnostic> {
     let mut out = Vec::new();
-    if obj.get("media").and_then(Value::as_str).unwrap_or("").is_empty() {
+    if obj
+        .get("media")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .is_empty()
+    {
         out.push(diag_on_key(
             text,
             "media",
@@ -421,8 +419,7 @@ fn handle_lsp(docs: &mut HashMap<String, String>, msg: &Value) -> Vec<Value> {
             };
             vec![ok(id, value)]
         }
-        "initialized" | "textDocument/didSave" => Vec::new(),
-        "" => Vec::new(),
+        "initialized" | "textDocument/didSave" | "" => Vec::new(),
         other if id.is_some() => vec![json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -605,15 +602,15 @@ fn read_lsp_message(stdin: &mut impl BufRead) -> io::Result<Option<Value>> {
         if line.is_empty() {
             break;
         }
-        if let Some(rest) = line.split_once(':') {
-            if rest.0.eq_ignore_ascii_case("Content-Length") {
-                content_length = Some(
-                    rest.1
-                        .trim()
-                        .parse::<usize>()
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-                );
-            }
+        if let Some(rest) = line.split_once(':')
+            && rest.0.eq_ignore_ascii_case("Content-Length")
+        {
+            content_length = Some(
+                rest.1
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            );
         }
     }
     let Some(len) = content_length else {
@@ -624,7 +621,9 @@ fn read_lsp_message(stdin: &mut impl BufRead) -> io::Result<Option<Value>> {
     };
     let mut buf = vec![0_u8; len];
     stdin.read_exact(&mut buf)?;
-    serde_json::from_slice(&buf).map(Some).map_err(io::Error::other)
+    serde_json::from_slice(&buf)
+        .map(Some)
+        .map_err(io::Error::other)
 }
 
 fn write_lsp_message(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
