@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/SightLoom
-          ref: d5cbbde00f80e644b461b4d5f45d7e5254bc367c
+          ref: 8ee820909d943a69f0dad78df3bf755107a9c5cb
           path: SightLoom
       - name: checkout Intelligence sibling
         uses: actions/checkout@v4
