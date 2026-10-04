@@ -24,13 +24,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/ReelForge
-          ref: 314107ccfe8b16bc3c85f1cc628822601f4f2bc8
+          ref: 89e0de3b711f8ef5b08f2730dad224926ea20c2f
           path: ReelForge
       - name: checkout SightLoom sibling
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/SightLoom
-          ref: 00706805873cf87af959882ff78491dbd626a456
+          ref: d5cbbde00f80e644b461b4d5f45d7e5254bc367c
           path: SightLoom
       - name: checkout Intelligence sibling
         uses: actions/checkout@v4
@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/ReelForge-Capture
-          ref: 645ed25adc1e007dde9c50fae67f8c5acd0203c7
+          ref: a7edd0f39a3b9acefee869bc95cad5e26ab5749b
           path: ReelForge-Capture
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,6 +55,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 1
       - name: test
         run: cargo test
       - name: bench compile
