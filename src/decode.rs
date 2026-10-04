@@ -141,6 +141,7 @@ pub fn extract_rgb_frames(video: &Path, out_dir: &Path, sample_fps: u32) -> Resu
         return Err(HostError::Ffmpeg("sample_fps must be > 0".into()));
     }
     std::fs::create_dir_all(out_dir)?;
+    clear_frame_pngs(out_dir)?;
     let pattern = out_dir.join("frame_%06d.png");
     let status = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
@@ -180,7 +181,35 @@ pub fn extract_rgb_frames(video: &Path, out_dir: &Path, sample_fps: u32) -> Resu
             "ffmpeg wrote no frames (empty or unreadable video)".into(),
         ));
     }
+    let names = frame_png_names(index);
+    let manifest = serde_json::json!({ "frames": names });
+    std::fs::write(out_dir.join("frames.json"), manifest.to_string())
+        .map_err(|e| HostError::Ffmpeg(format!("frame manifest: {e}")))?;
     Ok(frames)
+}
+
+/// Delete leftover `frame_*.png` so a shorter job cannot see the previous tail.
+pub fn clear_frame_pngs(out_dir: &Path) -> Result<()> {
+    if !out_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(out_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("frame_") && name.ends_with(".png") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Names a successful extract of `count` frames writes, in order.
+#[must_use]
+pub fn frame_png_names(count: u64) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("frame_{index:06}.png"))
+        .collect()
 }
 
 /// True when `--video cam` / `live` should grab a camera.
@@ -357,5 +386,35 @@ fn quoted_device(line: &str) -> Option<String> {
         None
     } else {
         Some(name.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_frame_pngs_drops_a_stale_tail() {
+        let dir = std::env::temp_dir().join(format!("rf-host-frames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("frame_000000.png"), b"red").unwrap();
+        std::fs::write(dir.join("frame_000009.png"), b"old").unwrap();
+        std::fs::write(dir.join("keep.txt"), b"keep").unwrap();
+        clear_frame_pngs(&dir).unwrap();
+        assert!(!dir.join("frame_000000.png").exists());
+        assert!(!dir.join("frame_000009.png").exists());
+        assert!(dir.join("keep.txt").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frame_manifest_names_stop_at_the_new_count() {
+        let names = frame_png_names(2);
+        assert_eq!(
+            names,
+            vec!["frame_000000.png".to_string(), "frame_000001.png".into()]
+        );
+        assert!(!names.iter().any(|name| name == "frame_000002.png"));
     }
 }
