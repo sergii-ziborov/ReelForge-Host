@@ -1,9 +1,9 @@
 //! Capture session / project ingest — no ONNX. Uses lavfi only for concat.
 
 use reelforge::{
-    CaptureProject, CropRect, MediaRef, MediaRefId, Metadata, ProjectId, RenderNodeKind, Retiming,
-    Sequence, SequenceId, SourceRange, TimelineClip, TimelineClipId, TimelineItem, TimelineTrack,
-    TimelineTrackId, TrackKind, compile_project,
+    CaptureProject, CropRect, Gap, MediaRef, MediaRefId, MediaTime, Metadata, ProjectId,
+    RenderNodeKind, Retiming, Sequence, SequenceId, SourceRange, TimelineClip, TimelineClipId,
+    TimelineItem, TimelineTrack, TimelineTrackId, TrackKind, compile_project,
 };
 use reelforge_host::{extract_rgb_frames, materialize_video, probe_video, resolve_capture_videos};
 use std::path::{Path, PathBuf};
@@ -134,7 +134,7 @@ fn sine_wav(path: &Path, hz: &str) {
             "-f",
             "lavfi",
             "-i",
-            &format!("sine=frequency={hz}:duration=0.5"),
+            &format!("sine=frequency={hz}:duration=0.15"),
             "-c:a",
             "pcm_s16le",
         ])
@@ -183,16 +183,21 @@ fn edited_project(picture: &Path, mic: &Path, system: &Path) -> CaptureProject {
         w: 32,
         h: 32,
     });
+    let gap = TimelineItem::Gap(Gap {
+        duration: MediaTime::from_secs(0.5, 1_000).unwrap(),
+    });
     let mut video = TimelineTrack::new(TimelineTrackId::new("v0"), TrackKind::Video);
+    video.items.push(gap.clone());
     video.items.push(TimelineItem::Clip(picture_clip));
     let mut mic_track = TimelineTrack::new(TimelineTrackId::new("a0"), TrackKind::Audio);
     mic_track
         .items
-        .push(TimelineItem::Clip(placed_clip("mic", "mic", 0.0, 0.5)));
+        .push(TimelineItem::Clip(placed_clip("mic", "mic", 0.0, 0.15)));
     let mut system_track = TimelineTrack::new(TimelineTrackId::new("a1"), TrackKind::Audio);
+    system_track.items.push(gap);
     system_track
         .items
-        .push(TimelineItem::Clip(placed_clip("system", "sys", 0.0, 0.5)));
+        .push(TimelineItem::Clip(placed_clip("system", "sys", 0.0, 0.15)));
     let mut sequence = Sequence::new(SequenceId::new("s"), "main");
     sequence.tracks.push(video);
     sequence.tracks.push(mic_track);
@@ -237,17 +242,62 @@ fn editorial_project_keeps_trim_crop_speed_and_both_audio_legs() {
     let info = probe_video(&out).unwrap();
     assert_eq!((info.width, info.height), (32, 32));
     assert!(
-        (0.35..=0.70).contains(&info.duration_secs),
-        "trimmed 1s at 2x should be ~0.5s, got {}",
+        (0.85..=1.25).contains(&info.duration_secs),
+        "0.5s gap plus trimmed 1s at 2x should be ~1s, got {}",
         info.duration_secs
     );
     assert!(info.has_audio);
     let frames = extract_rgb_frames(&out, &dir.path().join("frames"), 10).unwrap();
-    let frame = &frames[0];
-    let i = ((frame.height / 2) * frame.width + frame.width / 2) as usize * 3;
-    let rgb = &frame.rgb[i..i + 3];
+    assert!(frames.len() >= 8, "frames {}", frames.len());
+    let gap_px = center_rgb(&frames[0]);
+    let blue_px = center_rgb(&frames[7]);
     assert!(
-        rgb[2] > 150 && rgb[0] < 80,
-        "kept the blue half, got {rgb:?}"
+        gap_px.iter().all(|c| *c < 40),
+        "gap stays black, got {gap_px:?}"
     );
+    assert!(
+        blue_px[2] > 150 && blue_px[0] < 80,
+        "kept the blue half after the gap, got {blue_px:?}"
+    );
+    let bursts = audio_bursts(&out);
+    assert!(bursts.len() >= 2, "both legs should sound, got {bursts:?}");
+    assert!(bursts[0] < 0.2, "mic starts at 0, got {bursts:?}");
+    assert!(
+        (0.35..=0.8).contains(&bursts[1]),
+        "system starts after the 0.5s gap, got {bursts:?}"
+    );
+}
+
+fn center_rgb(frame: &reelforge_host::RgbFrame) -> [u8; 3] {
+    let x = frame.width / 2;
+    let y = frame.height / 2;
+    let i = (y as usize * frame.width as usize + x as usize) * 3;
+    [frame.rgb[i], frame.rgb[i + 1], frame.rgb[i + 2]]
+}
+
+fn audio_bursts(path: &Path) -> Vec<f64> {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"])
+        .output()
+        .expect("ffmpeg pcm");
+    assert!(out.status.success(), "pcm decode failed");
+    let mut bursts = Vec::new();
+    let mut heard = false;
+    let mut last = 0.0_f64;
+    for (i, chunk) in out.stdout.chunks_exact(4).enumerate() {
+        let sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let t = f64::from(u32::try_from(i).unwrap_or(u32::MAX)) / 16_000.0;
+        if sample.abs() > 0.05 {
+            if !heard || t - last > 0.2 {
+                bursts.push(t);
+            }
+            heard = true;
+            last = t;
+        } else if t - last > 0.05 {
+            heard = false;
+        }
+    }
+    bursts
 }
