@@ -24,21 +24,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/ReelForge
+          ref: 314107ccfe8b16bc3c85f1cc628822601f4f2bc8
           path: ReelForge
       - name: checkout SightLoom sibling
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/SightLoom
+          ref: c6e726f38275490de31b5ba52cd80ee7d42a97df
           path: SightLoom
       - name: checkout Intelligence sibling
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/ReelForge-Intelligence
+          ref: d48b2d733ec2e8af12400dbe7fe61ce8b89a50a3
           path: ReelForge-Intelligence
       - name: checkout Capture sibling
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/ReelForge-Capture
+          ref: 645ed25adc1e007dde9c50fae67f8c5acd0203c7
           path: ReelForge-Capture
       - uses: dtolnay/rust-toolchain@stable
         with:
