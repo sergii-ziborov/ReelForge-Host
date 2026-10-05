@@ -1,7 +1,9 @@
 //! JSON-RPC 2.0 MCP for the host process. Not the Intelligence compiler catalog.
 
 use crate::compile::{parse_redaction_kind, photo_binding, resolve_bridge};
-use crate::decode::{extract_rgb_frames, materialize_video, probe_video};
+use crate::decode::{
+    applied_frame_cap, extract_rgb_frames_limited, materialize_video, probe_video,
+};
 use crate::encode::run_graph;
 use crate::error::{HostError, Result};
 use crate::privacy::{PrivacyExceptOpts, privacy_except};
@@ -175,7 +177,7 @@ fn mcp_tools() -> Vec<Value> {
                     "work_dir": { "type": "string" },
                     "models_dir": { "type": "string" },
                     "sample_fps": { "type": "integer", "default": 5 },
-                    "max_frames": { "type": "integer", "default": 0 },
+                    "max_frames": { "type": "integer", "default": 0, "description": "0 uses the Host analysis cap. Extraction stops before further frames are decoded." },
                     "embed_every": { "type": "integer", "default": 1 }
                 }
             }),
@@ -211,7 +213,7 @@ fn mcp_tools() -> Vec<Value> {
                     "video": { "type": "string" },
                     "work_dir": { "type": "string" },
                     "sample_fps": { "type": "integer", "default": 5 },
-                    "max_frames": { "type": "integer", "default": 0 }
+                    "max_frames": { "type": "integer", "default": 0, "description": "0 uses the Host analysis cap. Extraction stops before further frames are decoded." }
                 }
             }),
         ),
@@ -303,13 +305,11 @@ fn ingest_video(svc: &mut HostService, args: &Value) -> Result<Value> {
         .unwrap_or(5)
         .max(1) as u32;
     let live_secs = args.get("live_secs").and_then(Value::as_f64).unwrap_or(3.0);
-    let max_frames = args.get("max_frames").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let max_frames =
+        applied_frame_cap(args.get("max_frames").and_then(Value::as_u64).unwrap_or(0) as u32);
     let video = materialize_video(&video, &work, live_secs)?;
     let info = probe_video(&video)?;
-    let mut frames = extract_rgb_frames(&video, &work.join("frames"), fps)?;
-    if max_frames > 0 && frames.len() > max_frames as usize {
-        frames.truncate(max_frames as usize);
-    }
+    let frames = extract_rgb_frames_limited(&video, &work.join("frames"), fps, max_frames)?;
     let pipe = svc.ensure_pipe()?;
     add_video_source(pipe, &video);
     let tracks = ingest_frames(pipe, &frames)?;
@@ -319,6 +319,7 @@ fn ingest_video(svc: &mut HostService, args: &Value) -> Result<Value> {
     svc.work_dir = work;
     Ok(json!({
         "frames": frames.len(),
+        "max_frames": max_frames,
         "tracks": tracks,
         "width": info.width,
         "height": info.height,

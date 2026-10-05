@@ -1,7 +1,9 @@
 //! Killer path: video + photo → blur everyone except the accepted subject.
 
 use crate::compile::{photo_binding, photo_except_plan, resolve_bridge};
-use crate::decode::{extract_rgb_frames, materialize_video, probe_video};
+use crate::decode::{
+    applied_frame_cap, extract_rgb_frames_limited, materialize_video, probe_video,
+};
 use crate::encode::run_graph;
 use crate::error::Result;
 use crate::vision::{
@@ -27,7 +29,7 @@ pub struct PrivacyExceptOpts {
     pub models_dir: PathBuf,
     /// Extracted frame rate for ingest (skip-frame vs source fps).
     pub sample_fps: u32,
-    /// Cap extracted frames (`0` = all).
+    /// Cap extracted frames. `0` uses the analysis cap, not the whole file.
     pub max_frames: u32,
     /// Seconds to grab when `--video cam` / `lavfi:`.
     pub live_secs: f64,
@@ -110,21 +112,19 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     std::fs::create_dir_all(&opts.work_dir)?;
     let video = materialize_video(&opts.video, &opts.work_dir, opts.live_secs.max(0.2))?;
     let info = probe_video(&video)?;
+    let max_frames = applied_frame_cap(opts.max_frames);
     eprintln!(
-        "extract frames @ {} fps from {} (max_frames={})",
+        "extract frames @ {} fps from {} (max_frames={max_frames})",
         opts.sample_fps.max(1),
         video.display(),
-        opts.max_frames
     );
     let t_extract = Instant::now();
-    let mut frames = extract_rgb_frames(
+    let frames = extract_rgb_frames_limited(
         &video,
         &opts.work_dir.join("frames"),
         opts.sample_fps.max(1),
+        max_frames,
     )?;
-    if opts.max_frames > 0 && frames.len() > opts.max_frames as usize {
-        frames.truncate(opts.max_frames as usize);
-    }
     let extract_ms = elapsed_ms(t_extract);
     eprintln!("extracted {} frames in {extract_ms} ms", frames.len());
 
@@ -295,10 +295,13 @@ pub fn ingest_only(
     })?;
     std::fs::create_dir_all(work_dir)?;
     let video = materialize_video(video, work_dir, live_secs.max(0.2))?;
-    let mut frames = extract_rgb_frames(&video, &work_dir.join("frames"), sample_fps.max(1))?;
-    if max_frames > 0 && frames.len() > max_frames as usize {
-        frames.truncate(max_frames as usize);
-    }
+    let max_frames = applied_frame_cap(max_frames);
+    let frames = extract_rgb_frames_limited(
+        &video,
+        &work_dir.join("frames"),
+        sample_fps.max(1),
+        max_frames,
+    )?;
     let (width, height) = frames.first().map_or((0, 0), |f| (f.width, f.height));
     let mut pipe = open_pipeline("ingest-only", models_dir)?;
     add_video_source(&mut pipe, &video);

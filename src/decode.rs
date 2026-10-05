@@ -131,22 +131,65 @@ pub fn probe_has_audio(path: &Path) -> Result<bool> {
     Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
-/// Extract RGB frames at `sample_fps` into `out_dir` (`frame_000000.png` …).
+/// Frames kept when a caller passes `0`.
+///
+/// `0` is this cap, not the whole file. A longer source is not decoded into RGB.
+pub const ANALYSIS_MAX_FRAMES: u32 = 300;
+
+/// `0` selects [`ANALYSIS_MAX_FRAMES`]. Any other value is the caller's cap.
+#[must_use]
+pub const fn applied_frame_cap(max_frames: u32) -> u32 {
+    if max_frames == 0 {
+        ANALYSIS_MAX_FRAMES
+    } else {
+        max_frames
+    }
+}
+
+/// Extract RGB frames at `sample_fps`, stopping at [`ANALYSIS_MAX_FRAMES`].
 ///
 /// # Errors
 ///
 /// ffmpeg failure or unreadable PNGs.
 pub fn extract_rgb_frames(video: &Path, out_dir: &Path, sample_fps: u32) -> Result<Vec<RgbFrame>> {
+    extract_rgb_frames_limited(video, out_dir, sample_fps, ANALYSIS_MAX_FRAMES)
+}
+
+/// Extract at most `max_frames` RGB frames.
+///
+/// ffmpeg stops at the cap, then only those PNGs are decoded. A previous
+/// `frame_*.png` tail is removed first. `frames.json` records `max_frames`
+/// and `hit_cap` when the source is longer than the cap. `max_frames == 0`
+/// is refused before any file is written.
+///
+/// # Errors
+///
+/// A zero cap, ffmpeg failure, or unreadable PNGs.
+pub fn extract_rgb_frames_limited(
+    video: &Path,
+    out_dir: &Path,
+    sample_fps: u32,
+    max_frames: u32,
+) -> Result<Vec<RgbFrame>> {
+    if max_frames == 0 {
+        return Err(HostError::Ffmpeg(
+            "extract refuses an unbounded frame list".into(),
+        ));
+    }
     if sample_fps == 0 {
         return Err(HostError::Ffmpeg("sample_fps must be > 0".into()));
     }
+    let hit_cap =
+        expected_samples(video, sample_fps).is_some_and(|count| count > u64::from(max_frames));
     std::fs::create_dir_all(out_dir)?;
     clear_frame_pngs(out_dir)?;
     let pattern = out_dir.join("frame_%06d.png");
+    let fps = format!("fps={sample_fps}");
+    let limit = max_frames.to_string();
     let status = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(video)
-        .args(["-vf", &format!("fps={sample_fps}"), "-start_number", "0"])
+        .args(["-vf", &fps, "-start_number", "0", "-frames:v", &limit])
         .arg(&pattern)
         .status()
         .map_err(|e| HostError::Ffmpeg(format!("ffmpeg spawn: {e}")))?;
@@ -158,7 +201,8 @@ pub fn extract_rgb_frames(video: &Path, out_dir: &Path, sample_fps: u32) -> Resu
 
     let mut frames = Vec::new();
     let mut index = 0_u64;
-    loop {
+    let cap = u64::from(max_frames);
+    while index < cap {
         let path = out_dir.join(format!("frame_{index:06}.png"));
         if !path.is_file() {
             break;
@@ -176,16 +220,43 @@ pub fn extract_rgb_frames(video: &Path, out_dir: &Path, sample_fps: u32) -> Resu
         });
         index += 1;
     }
+    let mut extra = index;
+    loop {
+        let path = out_dir.join(format!("frame_{extra:06}.png"));
+        if !path.is_file() {
+            break;
+        }
+        std::fs::remove_file(&path)?;
+        extra += 1;
+    }
     if frames.is_empty() {
         return Err(HostError::Ffmpeg(
             "ffmpeg wrote no frames (empty or unreadable video)".into(),
         ));
     }
     let names = frame_png_names(index);
-    let manifest = serde_json::json!({ "frames": names });
+    let manifest = serde_json::json!({
+        "frames": names,
+        "max_frames": max_frames,
+        "hit_cap": hit_cap,
+    });
     std::fs::write(out_dir.join("frames.json"), manifest.to_string())
         .map_err(|e| HostError::Ffmpeg(format!("frame manifest: {e}")))?;
     Ok(frames)
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn expected_samples(video: &Path, sample_fps: u32) -> Option<u64> {
+    let info = probe_video(video).ok()?;
+    if !(info.duration_secs.is_finite() && info.duration_secs > 0.0) {
+        return None;
+    }
+    let count = (info.duration_secs * f64::from(sample_fps)).round();
+    if count < 1.0 {
+        Some(1)
+    } else {
+        Some(count as u64)
+    }
 }
 
 /// Delete leftover `frame_*.png` so a shorter job cannot see the previous tail.
@@ -416,5 +487,66 @@ mod tests {
             vec!["frame_000000.png".to_string(), "frame_000001.png".into()]
         );
         assert!(!names.iter().any(|name| name == "frame_000002.png"));
+    }
+
+    #[test]
+    fn extract_refuses_an_unbounded_frame_list() {
+        let dir = std::env::temp_dir().join(format!("rf-host-nobound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = extract_rgb_frames_limited(Path::new("no-such.mp4"), &dir, 5, 0).unwrap_err();
+        assert!(err.to_string().contains("refuses"), "{err}");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn extract_stops_at_the_cap_and_clears_the_tail() {
+        if !ffmpeg_present() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rf-host-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("src.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=16x16:r=10:d=2",
+                "-frames:v",
+                "20",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let frames_dir = dir.join("frames");
+        std::fs::create_dir_all(&frames_dir).unwrap();
+        std::fs::write(frames_dir.join("frame_000010.png"), b"stale").unwrap();
+        let frames = extract_rgb_frames_limited(&video, &frames_dir, 10, 3).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!((frames[0].width, frames[0].height), (16, 16));
+        assert_eq!(frames[0].rgb.len(), 16 * 16 * 3);
+        assert!(frames_dir.join("frame_000002.png").is_file());
+        assert!(!frames_dir.join("frame_000003.png").exists());
+        assert!(!frames_dir.join("frame_000010.png").exists());
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(frames_dir.join("frames.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["max_frames"], 3);
+        assert_eq!(manifest["hit_cap"], true);
+        assert_eq!(manifest["frames"].as_array().map(Vec::len), Some(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ffmpeg_present() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|out| out.status.success())
     }
 }
