@@ -2,7 +2,7 @@
 
 use crate::compile::{photo_binding, photo_except_plan, resolve_bridge};
 use crate::decode::{
-    applied_frame_cap, extract_rgb_frames_limited, materialize_video, probe_video,
+    applied_frame_cap, extract_rgb_frames_limited, fresh_frames_dir, materialize_video, probe_video,
 };
 use crate::encode::run_graph;
 use crate::error::Result;
@@ -121,7 +121,7 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     let t_extract = Instant::now();
     let frames = extract_rgb_frames_limited(
         &video,
-        &opts.work_dir.join("frames"),
+        &fresh_frames_dir(&opts.work_dir),
         opts.sample_fps.max(1),
         max_frames,
     )?;
@@ -298,7 +298,7 @@ pub fn ingest_only(
     let max_frames = applied_frame_cap(max_frames);
     let frames = extract_rgb_frames_limited(
         &video,
-        &work_dir.join("frames"),
+        &fresh_frames_dir(work_dir),
         sample_fps.max(1),
         max_frames,
     )?;

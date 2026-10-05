@@ -30,8 +30,8 @@ pub use compile::{
 };
 pub use decode::{
     ANALYSIS_MAX_FRAMES, RgbFrame, VideoInfo, applied_frame_cap, extract_rgb_frames,
-    extract_rgb_frames_limited, grab_source, is_lavfi_token, is_live_token, materialize_video,
-    probe_has_audio, probe_video,
+    extract_rgb_frames_limited, fresh_frames_dir, grab_source, is_lavfi_token, is_live_token,
+    materialize_video, probe_has_audio, probe_video,
 };
 pub use encode::run_graph;
 pub use error::{HostError, MISSING_WEIGHTS_EXIT, Result};

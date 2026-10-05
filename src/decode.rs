@@ -2,8 +2,10 @@
 
 use crate::error::{HostError, Result};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One decoded RGB8 frame with media time.
 #[derive(Debug, Clone)]
@@ -11,8 +13,11 @@ pub struct RgbFrame {
     /// Zero-based extracted-frame index.
     pub index: u64,
     /// Presentation ticks at [`Self::timescale`].
+    ///
+    /// Source time from ffmpeg `showinfo` when that log is present, in
+    /// microseconds. Otherwise the sample index at `sample_fps`.
     pub ticks: i64,
-    /// Timescale (sample fps).
+    /// Ticks per second. `1_000_000` for a source presentation time.
     pub timescale: u32,
     /// Width.
     pub width: u32,
@@ -136,6 +141,23 @@ pub fn probe_has_audio(path: &Path) -> Result<bool> {
 /// `0` is this cap, not the whole file. A longer source is not decoded into RGB.
 pub const ANALYSIS_MAX_FRAMES: u32 = 300;
 
+/// Microseconds. Source presentation times from `showinfo` use this clock.
+const SOURCE_PTS_TIMESCALE: u32 = 1_000_000;
+
+/// A private directory for one extract. Two calls do not share a path.
+///
+/// [`clear_frame_pngs`] removes `frame_*.png` only inside the directory it is
+/// given, so one job cannot delete another job's frames.
+#[must_use]
+pub fn fresh_frames_dir(parent: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    parent.join(format!("frames-{nanos}-{n}"))
+}
+
 /// `0` selects [`ANALYSIS_MAX_FRAMES`]. Any other value is the caller's cap.
 #[must_use]
 pub const fn applied_frame_cap(max_frames: u32) -> u32 {
@@ -184,20 +206,25 @@ pub fn extract_rgb_frames_limited(
     std::fs::create_dir_all(out_dir)?;
     clear_frame_pngs(out_dir)?;
     let pattern = out_dir.join("frame_%06d.png");
-    let fps = format!("fps={sample_fps}");
+    let fps = format!("fps={sample_fps},showinfo");
     let limit = max_frames.to_string();
-    let status = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "info", "-y", "-i"])
         .arg(video)
         .args(["-vf", &fps, "-start_number", "0", "-frames:v", &limit])
         .arg(&pattern)
-        .status()
+        .output()
         .map_err(|e| HostError::Ffmpeg(format!("ffmpeg spawn: {e}")))?;
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr.chars().rev().take(400).collect::<String>();
+        let tail = tail.chars().rev().collect::<String>();
         return Err(HostError::Ffmpeg(format!(
-            "ffmpeg extract frames failed ({status})"
+            "ffmpeg extract frames failed ({}): {tail}",
+            output.status
         )));
     }
+    let source_pts = pts_times(&String::from_utf8_lossy(&output.stderr));
 
     let mut frames = Vec::new();
     let mut index = 0_u64;
@@ -234,15 +261,69 @@ pub fn extract_rgb_frames_limited(
             "ffmpeg wrote no frames (empty or unreadable video)".into(),
         ));
     }
+    apply_source_pts(&mut frames, &source_pts);
     let names = frame_png_names(index);
     let manifest = serde_json::json!({
         "frames": names,
         "max_frames": max_frames,
         "hit_cap": hit_cap,
+        "timescale": frames[0].timescale,
+        "pts_ticks": frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
     });
     std::fs::write(out_dir.join("frames.json"), manifest.to_string())
         .map_err(|e| HostError::Ffmpeg(format!("frame manifest: {e}")))?;
     Ok(frames)
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn pts_times(stderr: &str) -> Vec<f64> {
+    let mut times = Vec::new();
+    let mut rest = stderr;
+    while let Some(pos) = rest.find("pts_time:") {
+        let after = &rest[pos + "pts_time:".len()..];
+        let token = after.split_whitespace().next().unwrap_or("");
+        if let Ok(value) = token.parse::<f64>()
+            && value.is_finite()
+            && value >= 0.0
+        {
+            times.push(value);
+        }
+        rest = if token.is_empty() {
+            ""
+        } else {
+            &after[token.len()..]
+        };
+    }
+    times
+}
+
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn pts_ticks(secs: f64) -> Option<i64> {
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    let ticks = (secs * f64::from(SOURCE_PTS_TIMESCALE)).round();
+    if !ticks.is_finite() || ticks < 0.0 || ticks > i64::MAX as f64 {
+        return None;
+    }
+    Some(ticks as i64)
+}
+
+fn apply_source_pts(frames: &mut [RgbFrame], source_pts: &[f64]) {
+    if source_pts.len() < frames.len() {
+        return;
+    }
+    let mut timed = Vec::with_capacity(frames.len());
+    for secs in source_pts.iter().take(frames.len()) {
+        let Some(ticks) = pts_ticks(*secs) else {
+            return;
+        };
+        timed.push(ticks);
+    }
+    for (frame, ticks) in frames.iter_mut().zip(timed) {
+        frame.ticks = ticks;
+        frame.timescale = SOURCE_PTS_TIMESCALE;
+    }
 }
 
 #[allow(clippy::cast_sign_loss)]
@@ -540,7 +621,28 @@ mod tests {
         assert_eq!(manifest["max_frames"], 3);
         assert_eq!(manifest["hit_cap"], true);
         assert_eq!(manifest["frames"].as_array().map(Vec::len), Some(3));
+        assert_eq!(frames[0].timescale, 1_000_000);
+        assert_eq!(
+            frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
+            vec![0, 100_000, 200_000]
+        );
+        let other = fresh_frames_dir(&dir);
+        let again = extract_rgb_frames_limited(&video, &other, 10, 3).unwrap();
+        assert_eq!(again.len(), 3);
+        assert!(frames_dir.join("frame_000000.png").is_file());
+        assert!(other.join("frame_000000.png").is_file());
+        assert_ne!(frames_dir, other);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_frames_dirs_do_not_share_a_path() {
+        let parent = std::env::temp_dir().join(format!("rf-host-dirs-{}", std::process::id()));
+        let first = fresh_frames_dir(&parent);
+        let second = fresh_frames_dir(&parent);
+        assert_ne!(first, second);
+        assert!(first.starts_with(&parent));
+        assert!(second.starts_with(&parent));
     }
 
     fn ffmpeg_present() -> bool {
