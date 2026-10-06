@@ -8,7 +8,7 @@
 use crate::error::{HostError, Result};
 use reelforge_capture_schema::CaptureProject;
 use reelforge_capture_store::SessionStore;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 /// `capture:…` / `session:…` token for `--video`.
@@ -83,19 +83,33 @@ pub fn resolve_capture_videos(src: &Path) -> Result<Vec<PathBuf>> {
 /// One file if a single segment; otherwise concat into `work_dir/capture.mp4`.
 ///
 /// A project file that has sequences is rendered with [`reelforge::compile_project`]
-/// instead of concatenating library files.
+/// instead of concatenating library files. An unreadable or future schema does
+/// not fall through to that concat. Relative media stays inside the project
+/// directory; an import with no sequences still uses the media library.
 ///
 /// # Errors
 ///
 /// Resolve, compile, render, or ffmpeg concat.
 pub fn materialize_capture(src: &Path, work_dir: &Path) -> Result<PathBuf> {
-    if src.is_file()
-        && let Some(rendered) = render_timeline(src, work_dir)?
-    {
-        return Ok(rendered);
+    if src.is_file() {
+        let text = std::fs::read_to_string(src)?;
+        let project = CaptureProject::from_json(&text).map_err(|err| {
+            HostError::message(format!(
+                "capture project refuses an unreadable document: {err}"
+            ))
+        })?;
+        if !project.sequences.is_empty() {
+            return render_editorial(&text, work_dir);
+        }
+        let videos = videos_from_parsed(&project, src)?;
+        return materialize_videos(&videos, work_dir);
     }
     let videos = resolve_capture_videos(src)?;
-    match videos.as_slice() {
+    materialize_videos(&videos, work_dir)
+}
+
+fn materialize_videos(videos: &[PathBuf], work_dir: &Path) -> Result<PathBuf> {
+    match videos {
         [] => Err(HostError::message(
             "no committed Capture video (finish the session; do not glob segments/)",
         )),
@@ -144,14 +158,17 @@ fn videos_from_project_file(path: &Path) -> Result<Vec<PathBuf>> {
     let text = std::fs::read_to_string(path)?;
     let project = CaptureProject::from_json(&text)
         .map_err(|e| HostError::message(format!("capture project: {e}")))?;
+    videos_from_parsed(&project, path)
+}
+
+fn videos_from_parsed(project: &CaptureProject, project_file: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for media in &project.media {
         if media.role.as_deref() == Some("audio") {
             continue;
         }
-        let p = PathBuf::from(&media.uri);
-        if p.is_file() {
-            out.push(abs_path(&p));
+        if let Some(path) = project_media_path(project_file, &media.uri)? {
+            out.push(path);
         }
     }
     if out.is_empty() {
@@ -162,14 +179,79 @@ fn videos_from_project_file(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Render an editorial project. `Ok(None)` means "no sequences; use media URIs".
-fn render_timeline(path: &Path, work_dir: &Path) -> Result<Option<PathBuf>> {
-    let text = std::fs::read_to_string(path)?;
-    let Ok(project) = reelforge::CaptureProject::from_json(&text) else {
-        return Ok(None);
+/// A relative URI stays inside the project directory. An absolute file is kept.
+fn project_media_path(project_file: &Path, uri: &str) -> Result<Option<PathBuf>> {
+    let raw = Path::new(uri);
+    if raw.is_absolute() {
+        return Ok(raw.is_file().then(|| raw.to_path_buf()));
+    }
+    let Some(root) = project_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Err(HostError::message(
+            "capture project refuses a relative media path without a project directory",
+        ));
     };
-    if project.sequences.is_empty() {
+    let Some(lexical) = path_inside(root, raw) else {
+        return Err(HostError::message(format!(
+            "capture project refuses a media path outside the project: {uri}"
+        )));
+    };
+    if !lexical.is_file() {
         return Ok(None);
+    }
+    let root_canon = std::fs::canonicalize(root).map_err(|err| {
+        HostError::message(format!("capture project root {}: {err}", root.display()))
+    })?;
+    let file_canon = std::fs::canonicalize(&lexical).map_err(|err| {
+        HostError::message(format!(
+            "capture project media {}: {err}",
+            lexical.display()
+        ))
+    })?;
+    if !file_canon.starts_with(&root_canon) {
+        return Err(HostError::message(format!(
+            "capture project refuses a media path outside the project: {uri}"
+        )));
+    }
+    Ok(Some(file_canon))
+}
+
+fn path_inside(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut parts: Vec<std::ffi::OsString> = root
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect();
+    let root_len = parts.len();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.len() <= root_len {
+                    return None;
+                }
+                parts.pop();
+            }
+            Component::Normal(name) => parts.push(name.to_os_string()),
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts.into_iter().collect())
+}
+
+/// Render a project that already has sequences. A parse or compile failure
+/// does not fall through to concatenating the media library.
+fn render_editorial(text: &str, work_dir: &Path) -> Result<PathBuf> {
+    let project = reelforge::CaptureProject::from_json(text).map_err(|err| {
+        HostError::message(format!(
+            "capture project refuses to concat an editorial document: {err}"
+        ))
+    })?;
+    if project.sequences.is_empty() {
+        return Err(HostError::message(
+            "capture project refuses to render an import-only document as a timeline",
+        ));
     }
     let compiled = reelforge::compile_project(&project)
         .map_err(|e| HostError::message(format!("compile CaptureProject: {e}")))?;
@@ -189,7 +271,7 @@ fn render_timeline(path: &Path, work_dir: &Path) -> Result<Option<PathBuf>> {
     if !dest.is_file() || dest.metadata()?.len() == 0 {
         return Err(HostError::message("compiled CaptureProject wrote no video"));
     }
-    Ok(Some(dest))
+    Ok(dest)
 }
 
 fn abs_path(path: &Path) -> PathBuf {
@@ -358,5 +440,108 @@ mod tests {
         let videos = resolve_capture_videos(&project).unwrap();
         assert_eq!(videos.len(), 1);
         assert!(videos[0].ends_with("clip.mp4"));
+    }
+
+    #[test]
+    fn relative_media_resolves_inside_the_project() {
+        let dir = session_parent();
+        let clips = dir.path().join("clips");
+        std::fs::create_dir_all(&clips).unwrap();
+        std::fs::write(clips.join("a.mp4"), b"v").unwrap();
+        let project = dir.path().join("project.json");
+        std::fs::write(
+            &project,
+            r#"{
+              "version": 1,
+              "id": "prj_rel",
+              "name": "t",
+              "media": [{ "id": "v1", "uri": "clips/a.mp4", "role": "video" }]
+            }"#,
+        )
+        .unwrap();
+        let videos = resolve_capture_videos(&project).unwrap();
+        assert_eq!(videos.len(), 1);
+        assert!(videos[0].starts_with(std::fs::canonicalize(dir.path()).unwrap()));
+        assert!(videos[0].ends_with("a.mp4"));
+    }
+
+    #[test]
+    fn relative_media_outside_the_project_is_refused() {
+        let dir = session_parent();
+        let outside = dir.path().join("outside.mp4");
+        std::fs::write(&outside, b"secret").unwrap();
+        let nested = dir.path().join("proj");
+        std::fs::create_dir_all(&nested).unwrap();
+        let project = nested.join("project.json");
+        std::fs::write(
+            &project,
+            r#"{
+              "version": 1,
+              "id": "prj_out",
+              "name": "t",
+              "media": [{ "id": "v1", "uri": "../outside.mp4", "role": "video" }]
+            }"#,
+        )
+        .unwrap();
+        let err = resolve_capture_videos(&project).unwrap_err().to_string();
+        assert!(err.contains("refuses"), "{err}");
+        assert!(err.contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn future_project_schema_does_not_concat_media() {
+        let dir = session_parent();
+        let video = dir.path().join("clip.mp4");
+        std::fs::write(&video, b"v").unwrap();
+        let project = dir.path().join("project.json");
+        let uri = video.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &project,
+            format!(
+                r#"{{
+                  "version": 99,
+                  "id": "prj_new",
+                  "name": "t",
+                  "media": [{{ "id": "v1", "uri": "{uri}", "role": "video" }}],
+                  "sequences": [{{ "id": "seq", "name": "main" }}]
+                }}"#
+            ),
+        )
+        .unwrap();
+        let work = dir.path().join("work");
+        let err = materialize_capture(&project, &work)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refuses"), "{err}");
+        assert!(err.contains("newer"), "{err}");
+        assert!(!work.join("capture.mp4").exists());
+    }
+
+    #[test]
+    fn editorial_without_clips_does_not_return_the_library() {
+        let dir = session_parent();
+        let video = dir.path().join("clip.mp4");
+        std::fs::write(&video, b"library").unwrap();
+        let project = dir.path().join("project.json");
+        let uri = video.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &project,
+            format!(
+                r#"{{
+                  "version": 1,
+                  "id": "prj_edit",
+                  "name": "t",
+                  "media": [{{ "id": "v1", "uri": "{uri}", "role": "video" }}],
+                  "sequences": [{{ "id": "seq", "name": "main" }}]
+                }}"#
+            ),
+        )
+        .unwrap();
+        let work = dir.path().join("work");
+        let err = materialize_capture(&project, &work)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compile CaptureProject"), "{err}");
+        assert!(!work.join("capture.mp4").exists());
     }
 }
