@@ -486,12 +486,14 @@ struct ShowFrame {
     pts_time: f64,
 }
 
-/// The encoder can log one frame past the pictures `-frames:v` actually wrote.
+/// `-frames:v` stops the pictures. `showinfo` can keep logging frames after that.
+/// The written pictures are the first logged samples, in order.
 fn written_showinfo(notes: &[ShowFrame], written: usize) -> Result<Vec<ShowFrame>> {
-    if notes.len() != written && notes.len() != written.saturating_add(1) {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a presentation time that does not match the pictures".into(),
-        ));
+    if notes.len() < written {
+        return Err(HostError::Ffmpeg(format!(
+            "extract refuses a presentation time that does not match the pictures: logged {}, wrote {written}",
+            notes.len()
+        )));
     }
     Ok(notes.iter().take(written).copied().collect())
 }
@@ -1081,8 +1083,12 @@ mod tests {
 [Parsed_showinfo_2 @ 1] n:   1 pts: 1 pts_time:0.1 duration: 1 duration_time:0.1
 [Parsed_showinfo_0 @ 1] n:   6 pts: 6 pts_time:0.2 duration: 1 duration_time:0.0333333
 [Parsed_showinfo_2 @ 1] n:   2 pts: 2 pts_time:0.2 duration: 1 duration_time:0.1
+[Parsed_showinfo_2 @ 1] n:   3 pts: 3 pts_time:0.3 duration: 1 duration_time:0.1
+[Parsed_showinfo_0 @ 1] n:   9 pts: 9 pts_time:0.3 duration: 1 duration_time:0.0333333
+[Parsed_showinfo_2 @ 1] n:   4 pts: 4 pts_time:0.4 duration: 1 duration_time:0.1
 ";
         let (before_fps, after_fps) = show_streams(log).unwrap();
+        let after_fps = written_showinfo(&after_fps, 3).unwrap();
         let indexes = source_indexes(&before_fps, &after_fps).unwrap();
         assert_eq!(indexes, vec![0, 3, 6]);
         assert_eq!(
@@ -1099,6 +1105,11 @@ mod tests {
         assert_eq!(map.index_at(150_000, 1_000_000), Some(1));
         assert_eq!(map.source_index_at(150_000, 1_000_000), Some(3));
         assert_ne!(map.source_index_at(150_000, 1_000_000), Some(1));
+        let Err(err) = written_showinfo(&after_fps, 4) else {
+            panic!("a short showinfo log was accepted");
+        };
+        assert!(err.to_string().contains("logged 3"), "{err}");
+        assert!(err.to_string().contains("wrote 4"), "{err}");
     }
 
     #[test]
