@@ -68,6 +68,101 @@ fn version_and_methods() {
     assert!(stdout.contains("run_graph"), "{stdout}");
 }
 
+fn project_json(audio_extra: &str) -> String {
+    format!(
+        r#"{{
+  "version": 1,
+  "id": "p",
+  "name": "av",
+  "media": [{{ "id": "a", "uri": "a.mp4" }}],
+  "sequences": [{{
+    "id": "s",
+    "name": "main",
+    "tracks": [
+      {{
+        "id": "v0",
+        "kind": "video",
+        "items": [{{
+          "kind": "clip",
+          "id": "pic",
+          "media": "a",
+          "source": {{
+            "start": {{ "ticks": 0, "timescale": 1000 }},
+            "duration": {{ "ticks": 2000, "timescale": 1000 }}
+          }}
+        }}]
+      }},
+      {{
+        "id": "a0",
+        "kind": "audio",
+        "items": [{{
+          "kind": "clip",
+          "id": "snd",
+          "media": "a",
+          "source": {{
+            "start": {{ "ticks": 0, "timescale": 1000 }},
+            "duration": {{ "ticks": 2000, "timescale": 1000 }}
+          }}{audio_extra}
+        }}]
+      }}
+    ]
+  }}]
+}}"#,
+    )
+}
+
+#[test]
+fn project_command_explains_audio_speed_and_refuses_picture_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let speed = dir.path().join("speed.json");
+    std::fs::write(
+        &speed,
+        project_json(r#", "retiming": { "mode": "speed", "factor": 2.0 }"#),
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["project", speed.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}\n{stdout}");
+    assert!(stdout.contains("rf.transform.speed"), "{stdout}");
+    assert!(stdout.contains("rf.audio.mix"), "{stdout}");
+
+    let graph = Command::new(bin())
+        .args(["project", "--graph", speed.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let graph_out = String::from_utf8_lossy(&graph.stdout);
+    assert!(
+        graph.status.success(),
+        "{}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
+    assert!(graph_out.contains("\"rf.audio.mix\""), "{graph_out}");
+
+    let freeze = dir.path().join("freeze.json");
+    std::fs::write(
+        &freeze,
+        project_json(
+            r#", "retiming": { "mode": "freeze", "at": { "ticks": 500, "timescale": 1000 }, "hold": { "ticks": 1000, "timescale": 1000 } }"#,
+        ),
+    )
+    .unwrap();
+    let refused = Command::new(bin())
+        .args(["project", freeze.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{err}");
+    assert!(
+        err.contains("clip snd: freeze is a picture retime"),
+        "{err}"
+    );
+    assert!(err.contains("audio track"), "{err}");
+}
+
 #[test]
 fn unknown_style_fails_before_weights() {
     let out = Command::new(bin())

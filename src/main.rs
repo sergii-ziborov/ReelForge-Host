@@ -85,6 +85,14 @@ enum Commands {
         #[arg(long, default_value = "pixelate")]
         style: String,
     },
+    /// Compile a CaptureProject JSON file. Does not encode.
+    Project {
+        /// Path to `CaptureProject` JSON.
+        path: PathBuf,
+        /// Print the compiled `RenderGraph` JSON instead of the schedule.
+        #[arg(long)]
+        graph: bool,
+    },
     /// Detect+track+embed only — prints ingest FPS (no photo, no encode).
     Ingest {
         /// File, `cam`, or `lavfi:testsrc=size=640x360:rate=10`.
@@ -182,6 +190,7 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
+        Commands::Project { path, graph } => compile_project_file(&path, graph),
         Commands::Ingest {
             video,
             work_dir,
@@ -206,6 +215,29 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
             Ok(())
         }
     }
+}
+
+fn compile_project_file(path: &std::path::Path, graph_json: bool) -> reelforge_host::Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let project = reelforge::CaptureProject::from_json(&text)
+        .map_err(|err| reelforge_host::HostError::message(err.to_string()))?;
+    let compiled = reelforge::compile_project(&project)
+        .map_err(|err| reelforge_host::HostError::message(err.to_string()))?;
+    if graph_json {
+        let json = compiled
+            .graph
+            .to_json_pretty()
+            .map_err(|err| reelforge_host::HostError::message(err.to_string()))?;
+        println!("{json}");
+    } else {
+        let explained = reelforge::explain_render_graph(&compiled.graph)
+            .map_err(|err| reelforge_host::HostError::message(err.to_string()))?;
+        println!("{explained}");
+    }
+    for warning in &compiled.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
 }
 
 fn serve_stdio() -> reelforge_host::Result<()> {
