@@ -3,10 +3,14 @@
 //! Local-first: default bind is loopback. Non-loopback requires a bearer token.
 
 use crate::error::{HostError, Result};
-use crate::mcp::{HostService, MCP_PROTOCOL_VERSION, handle_jsonrpc};
-use serde_json::json;
+use crate::mcp::{CancelScope, HostService, MCP_PROTOCOL_VERSION, handle_jsonrpc};
+use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::thread;
 use std::time::Duration;
 
 /// Default `--http` bind when the flag has no value.
@@ -68,50 +72,80 @@ pub fn serve_http_listener(listener: TcpListener, token: Option<String>) -> Resu
         .map_err(|e| HostError::message(format!("http local_addr: {e}")))?;
     eprintln!("reelforge-host MCP http://{addr}/mcp");
     let mut svc = HostService::new();
+    let scope = svc.cancel_scope();
     let token = token
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_owned);
+    let (jobs, rx) = mpsc::channel::<Job>();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_flag = Arc::clone(&shutdown);
+    let worker = thread::spawn(move || {
+        while let Ok(job) = rx.recv() {
+            let response = handle_jsonrpc(&mut svc, &job.body);
+            let stop = job.stop;
+            let _ = job.reply.send(response);
+            if stop {
+                shutdown_flag.store(true, Ordering::Relaxed);
+                let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(200));
+                break;
+            }
+        }
+    });
     for incoming in listener.incoming() {
-        let mut stream = incoming.map_err(|e| HostError::message(format!("http accept: {e}")))?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-        match handle_connection(&mut svc, &mut stream, token.as_deref()) {
-            Ok(true) => break,
-            Ok(false) => {}
-            Err(e) => {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut stream = match incoming {
+            Ok(stream) => stream,
+            Err(err) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(HostError::message(format!("http accept: {err}")));
+            }
+        };
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let jobs = jobs.clone();
+        let scope = scope.clone();
+        let token = token.clone();
+        thread::spawn(move || {
+            if let Err(err) = serve_one(&scope, &jobs, &mut stream, token.as_deref()) {
                 let _ = write_http(
                     &mut stream,
                     400,
                     "application/json",
-                    &json!({ "error": e.to_string() }).to_string(),
+                    &json!({ "error": err.to_string() }).to_string(),
                 );
             }
-        }
+        });
     }
+    drop(jobs);
+    let _ = worker.join();
     Ok(())
 }
 
-fn bind_host(spec: &str) -> &str {
-    let spec = spec.trim();
-    if let Some(rest) = spec.strip_prefix('[')
-        && let Some(end) = rest.find(']')
-    {
-        return &rest[..end];
-    }
-    spec.rsplit_once(':').map_or(spec, |(host, _)| host)
+struct Job {
+    body: String,
+    stop: bool,
+    reply: Sender<Option<Value>>,
 }
 
-fn handle_connection(
-    svc: &mut HostService,
+fn serve_one(
+    scope: &CancelScope,
+    jobs: &Sender<Job>,
     stream: &mut TcpStream,
     token: Option<&str>,
-) -> Result<bool> {
+) -> Result<()> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let req = read_request(stream)?;
     if req.method == "OPTIONS" {
         write_http(stream, 204, "text/plain", "")?;
-        return Ok(false);
+        return Ok(());
     }
     if req.method == "GET" && (req.path == "/" || req.path == "/health") {
         let body = json!({
@@ -121,7 +155,7 @@ fn handle_connection(
         })
         .to_string();
         write_http(stream, 200, "application/json", &body)?;
-        return Ok(false);
+        return Ok(());
     }
     if req.method != "POST" || (req.path != "/" && req.path != "/mcp") {
         write_http(
@@ -130,7 +164,7 @@ fn handle_connection(
             "application/json",
             &json!({ "error": "POST /mcp" }).to_string(),
         )?;
-        return Ok(false);
+        return Ok(());
     }
     if let Some(want) = token
         && !token_matches(&req, want)
@@ -141,19 +175,34 @@ fn handle_connection(
             "application/json",
             &json!({ "error": "unauthorized" }).to_string(),
         )?;
-        return Ok(false);
+        return Ok(());
     }
+    if scope.take_cancel_line(&req.body) {
+        write_http(stream, 202, "application/json", "")?;
+        return Ok(());
+    }
+    let (reply_tx, reply_rx) = mpsc::channel();
+    jobs.send(Job {
+        stop: method_is_shutdown(&req.body),
+        body: req.body,
+        reply: reply_tx,
+    })
+    .map_err(|_| HostError::message("http worker stopped"))?;
+    match reply_rx.recv() {
+        Ok(None) => write_http(stream, 202, "application/json", ""),
+        Ok(Some(resp)) => write_http(stream, 200, "application/json", &resp.to_string()),
+        Err(_) => Err(HostError::message("http worker stopped")),
+    }
+}
 
-    let stop = method_is_shutdown(&req.body);
-    match handle_jsonrpc(svc, &req.body) {
-        None => {
-            write_http(stream, 202, "application/json", "")?;
-        }
-        Some(resp) => {
-            write_http(stream, 200, "application/json", &resp.to_string())?;
-        }
+fn bind_host(spec: &str) -> &str {
+    let spec = spec.trim();
+    if let Some(rest) = spec.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &rest[..end];
     }
-    Ok(stop)
+    spec.rsplit_once(':').map_or(spec, |(host, _)| host)
 }
 
 struct HttpRequest {
@@ -314,6 +363,12 @@ fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn loopback_binds_do_not_need_token() {
@@ -325,5 +380,110 @@ mod tests {
         assert!(require_token_for_bind("127.0.0.1:1", None).is_ok());
         assert!(require_token_for_bind("0.0.0.0:8787", None).is_err());
         assert!(require_token_for_bind("0.0.0.0:8787", Some("secret")).is_ok());
+    }
+
+    #[test]
+    fn cancel_notification_stops_the_inflight_call() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            serve_http_listener(listener, Some("secret".to_owned())).unwrap();
+        });
+        let mut ready = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok() {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ready, "http server did not accept");
+        let (status, _) = post(
+            addr,
+            "/mcp",
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        );
+        assert_eq!(status, 401, "missing token");
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&done);
+        let waiter = thread::spawn(move || {
+            let result = post(
+                addr,
+                "/mcp",
+                Some("secret"),
+                r#"{"jsonrpc":"2.0","id":5,"method":"wait_for_cancel"}"#,
+            );
+            finished.store(true, Ordering::Relaxed);
+            result
+        });
+        thread::sleep(Duration::from_millis(80));
+        let (status, _) = post(
+            addr,
+            "/mcp",
+            None,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}"#,
+        );
+        assert_eq!(status, 401, "cancel without token");
+        thread::sleep(Duration::from_millis(40));
+        assert!(
+            !done.load(Ordering::Relaxed),
+            "unauthenticated cancel stopped the call"
+        );
+        let (status, _) = post(
+            addr,
+            "/mcp",
+            Some("secret"),
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}"#,
+        );
+        assert_eq!(status, 202, "cancel notification");
+        let (status, body) = waiter.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("extract cancelled"),
+            "{body}"
+        );
+        let _ = post(
+            addr,
+            "/mcp",
+            Some("secret"),
+            r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#,
+        );
+        server.join().unwrap();
+    }
+
+    fn post(
+        addr: std::net::SocketAddr,
+        path: &str,
+        token: Option<&str>,
+        body: &str,
+    ) -> (u16, Value) {
+        let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth}Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(req.as_bytes()).unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        let (head, raw) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        let value = serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw }));
+        (status, value)
     }
 }

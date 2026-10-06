@@ -177,6 +177,7 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
                 live_secs,
                 embed_every,
                 redaction: parse_redaction_kind(Some(&style))?,
+                cancel: None,
             })?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
@@ -209,15 +210,29 @@ fn run(cli: Cli) -> reelforge_host::Result<()> {
 
 fn serve_stdio() -> reelforge_host::Result<()> {
     let mut svc = HostService::new();
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    let scope = svc.cancel_scope();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if scope.take_cancel_line(line) {
+                continue;
+            }
+            if tx.send(line.to_owned()).is_err() {
+                break;
+            }
         }
-        if let Some(resp) = handle_jsonrpc(&mut svc, line) {
+    });
+    let mut stdout = io::stdout();
+    while let Ok(line) = rx.recv() {
+        if let Some(resp) = handle_jsonrpc(&mut svc, &line) {
             writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
             stdout.flush()?;
             if line.contains("\"shutdown\"")

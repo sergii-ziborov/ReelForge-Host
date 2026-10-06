@@ -359,6 +359,11 @@ impl ExtractCancel {
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
     }
+
+    /// Clear the flag so a later request is not born cancelled.
+    pub fn reset(&self) {
+        self.flag.store(false, Ordering::Relaxed);
+    }
 }
 
 impl Default for ExtractCancel {
@@ -403,7 +408,7 @@ pub fn extract_rgb_frames_cancellable(
         extract_sampled_pictures_cancellable(video, out_dir, sample_fps, max_frames, cancel)?;
     let mut frames = Vec::with_capacity(pictures.len());
     let batch = pictures.len().max(1);
-    visit_rgb_batches(&pictures, batch, |chunk| {
+    visit_rgb_batches_cancellable(&pictures, batch, cancel, |chunk| {
         frames.extend(chunk.iter().cloned());
         Ok(())
     })?;
@@ -510,6 +515,22 @@ pub fn extract_sampled_pictures_cancellable(
 pub fn visit_rgb_batches(
     pictures: &[SampledPicture],
     batch: usize,
+    visit: impl FnMut(&[RgbFrame]) -> Result<()>,
+) -> Result<()> {
+    visit_rgb_batches_cancellable(pictures, batch, None, visit)
+}
+
+/// Like [`visit_rgb_batches`], but `cancel` stops the walk before the next PNG is decoded.
+///
+/// A flag that is already cancelled does not open a picture.
+///
+/// # Errors
+///
+/// Cancellation, `batch == 0`, a PNG that cannot be decoded, or an error from `visit`.
+pub fn visit_rgb_batches_cancellable(
+    pictures: &[SampledPicture],
+    batch: usize,
+    cancel: Option<&ExtractCancel>,
     mut visit: impl FnMut(&[RgbFrame]) -> Result<()>,
 ) -> Result<()> {
     if batch == 0 {
@@ -519,8 +540,14 @@ pub fn visit_rgb_batches(
     }
     let mut held = Vec::with_capacity(batch.min(pictures.len()));
     for chunk in pictures.chunks(batch) {
+        if cancel.is_some_and(ExtractCancel::is_cancelled) {
+            return Err(HostError::Ffmpeg("extract cancelled".into()));
+        }
         held.clear();
         for picture in chunk {
+            if cancel.is_some_and(ExtractCancel::is_cancelled) {
+                return Err(HostError::Ffmpeg("extract cancelled".into()));
+            }
             held.push(picture.load()?);
         }
         visit(&held)?;
@@ -1317,6 +1344,98 @@ mod tests {
             frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
             vec![0, 100_000, 200_000]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_clears_extract_cancel() {
+        let cancel = ExtractCancel::new();
+        cancel.cancel();
+        assert!(cancel.is_cancelled());
+        cancel.reset();
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_batch_does_not_open_pictures() {
+        let missing = std::env::temp_dir().join(format!(
+            "rf-host-missing-picture-{}-{}.png",
+            std::process::id(),
+            "cancel"
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let pictures = [SampledPicture {
+            index: 0,
+            source_index: 0,
+            ticks: 0,
+            timescale: 1,
+            path: missing.clone(),
+        }];
+        let cancel = ExtractCancel::new();
+        cancel.cancel();
+        let err = visit_rgb_batches_cancellable(&pictures, 1, Some(&cancel), |_| {
+            panic!("visitor ran after cancel");
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cancel"), "{err}");
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn cancel_between_batches_does_not_decode_the_next_picture() {
+        if !ffmpeg_present() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rf-host-batch-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("one.png");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=gray:s=8x8:r=1",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&first)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let pictures = [
+            SampledPicture {
+                index: 0,
+                source_index: 0,
+                ticks: 0,
+                timescale: 1,
+                path: first,
+            },
+            SampledPicture {
+                index: 1,
+                source_index: 1,
+                ticks: 1,
+                timescale: 1,
+                path: dir.join("missing.png"),
+            },
+        ];
+        let cancel = ExtractCancel::new();
+        let flag = cancel.clone();
+        let mut seen = 0_usize;
+        let err = visit_rgb_batches_cancellable(&pictures, 1, Some(&cancel), |chunk| {
+            seen += chunk.len();
+            flag.cancel();
+            Ok(())
+        });
+        let Err(err) = err else {
+            panic!("the picture after cancel was decoded");
+        };
+        assert!(err.to_string().contains("cancel"), "{err}");
+        assert_eq!(seen, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

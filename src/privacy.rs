@@ -2,8 +2,9 @@
 
 use crate::compile::{photo_binding, photo_except_plan, resolve_bridge};
 use crate::decode::{
-    RGB_BATCH_FRAMES, applied_frame_cap, extract_sampled_pictures, fresh_frames_dir,
-    materialize_video, probe_video, visit_rgb_batches,
+    ExtractCancel, RGB_BATCH_FRAMES, applied_frame_cap, extract_sampled_pictures,
+    extract_sampled_pictures_cancellable, fresh_frames_dir, materialize_video, probe_video,
+    visit_rgb_batches, visit_rgb_batches_cancellable,
 };
 use crate::encode::run_graph;
 use crate::error::Result;
@@ -38,6 +39,8 @@ pub struct PrivacyExceptOpts {
     pub embed_every: u32,
     /// Privacy fill. Host default is pixelate (gaussian is recoverable).
     pub redaction: reelforge_intelligence_core::RedactionKind,
+    /// When set, extract and later RGB batches stop after the flag is raised.
+    pub cancel: Option<ExtractCancel>,
 }
 
 /// Result of the killer path.
@@ -120,11 +123,12 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
         video.display(),
     );
     let t_extract = Instant::now();
-    let pictures = extract_sampled_pictures(
+    let pictures = extract_sampled_pictures_cancellable(
         &video,
         &fresh_frames_dir(&opts.work_dir),
         opts.sample_fps.max(1),
         max_frames,
+        opts.cancel.as_ref(),
     )?;
     let extract_ms = elapsed_ms(t_extract);
     eprintln!("extracted {} frames in {extract_ms} ms", pictures.len());
@@ -144,7 +148,14 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
 
     let t_ingest = Instant::now();
     let mut tracks = 0_usize;
-    visit_rgb_batches(&pictures, RGB_BATCH_FRAMES, |batch| {
+    visit_rgb_batches_cancellable(&pictures, RGB_BATCH_FRAMES, opts.cancel.as_ref(), |batch| {
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(ExtractCancel::is_cancelled)
+        {
+            return Err(crate::error::HostError::Ffmpeg("extract cancelled".into()));
+        }
         tracks = tracks.max(ingest_frames_strided(&mut pipe, batch, opts.embed_every)?);
         Ok(())
     })?;

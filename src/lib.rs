@@ -34,6 +34,7 @@ pub use decode::{
     extract_rgb_frames_cancellable, extract_rgb_frames_limited, extract_sampled_pictures,
     extract_sampled_pictures_cancellable, fresh_frames_dir, grab_source, is_lavfi_token,
     is_live_token, materialize_video, probe_has_audio, probe_video, visit_rgb_batches,
+    visit_rgb_batches_cancellable,
 };
 pub use encode::run_graph;
 pub use error::{HostError, MISSING_WEIGHTS_EXIT, Result};
@@ -45,7 +46,9 @@ pub use lsp::{
     EDIT_TYPES, JOB_KEYS, LspCompletion, LspDiagnostic, SELECTOR_KINDS, STYLES, completions_at,
     diagnose_text, hover_at, serve_lsp,
 };
-pub use mcp::{HostService, MCP_PROTOCOL_VERSION, METHODS, dispatch, handle_jsonrpc, list_methods};
+pub use mcp::{
+    CancelScope, HostService, MCP_PROTOCOL_VERSION, METHODS, dispatch, handle_jsonrpc, list_methods,
+};
 pub use models::{
     DEFAULT_MODELS_DIR, ModelPaths, missing_weights_help, require_weights, resolve_models_dir,
 };

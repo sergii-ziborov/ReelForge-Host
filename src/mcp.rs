@@ -2,8 +2,8 @@
 
 use crate::compile::{parse_redaction_kind, photo_binding, resolve_bridge};
 use crate::decode::{
-    RGB_BATCH_FRAMES, applied_frame_cap, extract_sampled_pictures, fresh_frames_dir,
-    materialize_video, probe_video, visit_rgb_batches,
+    ExtractCancel, RGB_BATCH_FRAMES, applied_frame_cap, extract_sampled_pictures_cancellable,
+    fresh_frames_dir, materialize_video, probe_video, visit_rgb_batches_cancellable,
 };
 use crate::encode::run_graph;
 use crate::error::{HostError, Result};
@@ -16,6 +16,7 @@ use reelforge_intelligence_core::{SemanticEditPlan, bindings_from_value, rewrite
 use serde_json::{Value, json};
 use sightloom_host::HostPipeline;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// JSON-RPC protocol version (same family as Intelligence).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -47,6 +48,20 @@ pub struct HostService {
     pub work_dir: PathBuf,
     pipe: Option<HostPipeline>,
     last_package: Option<PathBuf>,
+    cancel: ExtractCancel,
+    inflight: Arc<Mutex<Option<Value>>>,
+    early: Arc<Mutex<Vec<Value>>>,
+}
+
+/// Shared cancel flag for one MCP session.
+///
+/// The reader records `notifications/cancelled` here while a call is still
+/// inside [`handle_jsonrpc`]. Cloning shares the same flag.
+#[derive(Clone, Debug)]
+pub struct CancelScope {
+    cancel: ExtractCancel,
+    inflight: Arc<Mutex<Option<Value>>>,
+    early: Arc<Mutex<Vec<Value>>>,
 }
 
 impl HostService {
@@ -58,7 +73,43 @@ impl HostService {
             work_dir: PathBuf::from("work"),
             pipe: None,
             last_package: None,
+            cancel: ExtractCancel::new(),
+            inflight: Arc::new(Mutex::new(None)),
+            early: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Flag and in-flight id shared with the MCP reader.
+    #[must_use]
+    pub fn cancel_scope(&self) -> CancelScope {
+        CancelScope {
+            cancel: self.cancel.clone(),
+            inflight: Arc::clone(&self.inflight),
+            early: Arc::clone(&self.early),
+        }
+    }
+
+    fn arm_request(&self, id: &Value) -> InflightGuard {
+        if self.take_early(id) {
+            self.cancel.cancel();
+        } else {
+            self.cancel.reset();
+        }
+        *lock_mut(&self.inflight) = Some(id.clone());
+        if self.take_early(id) {
+            self.cancel.cancel();
+        }
+        InflightGuard {
+            inflight: Arc::clone(&self.inflight),
+            id: id.clone(),
+        }
+    }
+
+    fn take_early(&self, id: &Value) -> bool {
+        let mut early = lock_mut(&self.early);
+        let hit = early.iter().any(|item| item == id);
+        early.retain(|item| item != id);
+        hit
     }
 
     fn pipe_mut(&mut self) -> Result<&mut HostPipeline> {
@@ -74,6 +125,81 @@ impl HostService {
         self.pipe
             .as_mut()
             .ok_or_else(|| HostError::message("pipeline missing"))
+    }
+}
+
+impl CancelScope {
+    /// Whether the in-flight request has been cancelled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Record `notifications/cancelled` and return true when `raw` is that notification.
+    ///
+    /// The caller must not dispatch a consumed line. A missing `requestId` is ignored.
+    #[must_use]
+    pub fn take_cancel_line(&self, raw: &str) -> bool {
+        let Some(id) = cancelled_request_id(raw) else {
+            return false;
+        };
+        self.note_cancelled(&id);
+        true
+    }
+
+    fn note_cancelled(&self, id: &Value) {
+        if inflight_is(&self.inflight, id) {
+            self.cancel.cancel();
+            return;
+        }
+        {
+            let mut early = lock_mut(&self.early);
+            if !early.iter().any(|item| item == id) {
+                if early.len() == 32 {
+                    early.remove(0);
+                }
+                early.push(id.clone());
+            }
+        }
+        if inflight_is(&self.inflight, id) {
+            self.cancel.cancel();
+        }
+    }
+}
+
+fn cancelled_request_id(raw: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    if value.get("method").and_then(Value::as_str) != Some("notifications/cancelled") {
+        return None;
+    }
+    value
+        .get("params")
+        .and_then(|params| params.get("requestId"))
+        .filter(|id| !id.is_null())
+        .cloned()
+}
+
+fn inflight_is(inflight: &Mutex<Option<Value>>, id: &Value) -> bool {
+    lock_mut(inflight).as_ref() == Some(id)
+}
+
+fn lock_mut<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+struct InflightGuard {
+    inflight: Arc<Mutex<Option<Value>>>,
+    id: Value,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut slot = lock_mut(&self.inflight);
+        if slot.as_ref() == Some(&self.id) {
+            *slot = None;
+        }
     }
 }
 
@@ -94,6 +220,21 @@ pub fn handle_jsonrpc(svc: &mut HostService, raw: &str) -> Option<Value> {
     let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
     let params = parsed.get("params").cloned().unwrap_or(Value::Null);
     let is_notification = parsed.get("id").is_none();
+    let _inflight = parsed
+        .get("id")
+        .filter(|value| !value.is_null())
+        .map(|value| svc.arm_request(value));
+
+    if method == "notifications/cancelled" {
+        if let Some(request_id) = params.get("requestId").filter(|value| !value.is_null()) {
+            svc.cancel_scope().note_cancelled(request_id);
+        }
+        return if is_notification {
+            None
+        } else {
+            Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} }))
+        };
+    }
 
     let result = match method {
         "initialize" => Ok(json!({
@@ -105,6 +246,8 @@ pub fn handle_jsonrpc(svc: &mut HostService, raw: &str) -> Option<Value> {
             }
         })),
         "notifications/initialized" | "initialized" | "ping" => Ok(json!({})),
+        #[cfg(test)]
+        "wait_for_cancel" => wait_for_cancel(svc),
         "tools/list" => Ok(json!({ "tools": mcp_tools() })),
         "tools/call" => match params.get("name").and_then(Value::as_str) {
             None => Err(HostError::message("tools/call: name required")),
@@ -156,7 +299,7 @@ pub fn dispatch(svc: &mut HostService, method: &str, args: &Value) -> Result<Val
         "rewrite_plan" => rewrite(args),
         "resolve_bridge" => resolve(svc, args),
         "run_graph" => run(args),
-        "privacy_except" => except(args),
+        "privacy_except" => except(svc, args),
         other => Err(HostError::message(format!("unknown host method `{other}`"))),
     }
 }
@@ -311,11 +454,16 @@ fn ingest_video(svc: &mut HostService, args: &Value) -> Result<Value> {
     let video = materialize_video(&video, &work, live_secs)?;
     let info = probe_video(&video)?;
     let frames_dir = fresh_frames_dir(&work);
-    let pictures = extract_sampled_pictures(&video, &frames_dir, fps, max_frames)?;
+    let cancel = svc.cancel.clone();
+    let pictures =
+        extract_sampled_pictures_cancellable(&video, &frames_dir, fps, max_frames, Some(&cancel))?;
     let pipe = svc.ensure_pipe()?;
     add_video_source(pipe, &video);
     let mut tracks = 0_usize;
-    visit_rgb_batches(&pictures, RGB_BATCH_FRAMES, |batch| {
+    visit_rgb_batches_cancellable(&pictures, RGB_BATCH_FRAMES, Some(&cancel), |batch| {
+        if cancel.is_cancelled() {
+            return Err(HostError::Ffmpeg("extract cancelled".into()));
+        }
         tracks = tracks.max(ingest_frames(pipe, batch)?);
         Ok(())
     })?;
@@ -407,7 +555,7 @@ fn run(args: &Value) -> Result<Value> {
     Ok(json!({ "output": written, "audio": audio }))
 }
 
-fn except(args: &Value) -> Result<Value> {
+fn except(svc: &HostService, args: &Value) -> Result<Value> {
     let opts = PrivacyExceptOpts {
         video: arg_path(args, "video")?,
         photo: arg_path(args, "photo")?,
@@ -425,7 +573,56 @@ fn except(args: &Value) -> Result<Value> {
         live_secs: args.get("live_secs").and_then(Value::as_f64).unwrap_or(3.0),
         embed_every: args.get("embed_every").and_then(Value::as_u64).unwrap_or(1) as u32,
         redaction: parse_redaction_kind(args.get("style").and_then(Value::as_str))?,
+        cancel: Some(svc.cancel.clone()),
     };
     let out = privacy_except(&opts)?;
     Ok(serde_json::to_value(out)?)
+}
+
+#[cfg(test)]
+fn wait_for_cancel(svc: &HostService) -> Result<Value> {
+    let start = std::time::Instant::now();
+    while !svc.cancel.is_cancelled() {
+        if start.elapsed() > std::time::Duration::from_secs(3) {
+            return Err(HostError::message("cancel did not arrive"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(HostError::Ffmpeg("extract cancelled".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_scope_hits_only_the_inflight_id() {
+        let svc = HostService::new();
+        let scope = svc.cancel_scope();
+        let guard = svc.arm_request(&json!(4));
+        assert!(scope.take_cancel_line(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}"#
+        ));
+        assert!(!scope.is_cancelled());
+        assert!(scope.take_cancel_line(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}}"#
+        ));
+        assert!(scope.is_cancelled());
+        drop(guard);
+        let _next = svc.arm_request(&json!(5));
+        assert!(!scope.is_cancelled());
+        assert!(!scope.take_cancel_line(r#"{"jsonrpc":"2.0","method":"ping"}"#));
+    }
+
+    #[test]
+    fn early_cancel_is_waiting_when_the_request_starts() {
+        let svc = HostService::new();
+        let scope = svc.cancel_scope();
+        assert!(scope.take_cancel_line(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"job-1"}}"#
+        ));
+        assert!(!scope.is_cancelled());
+        let _guard = svc.arm_request(&json!("job-1"));
+        assert!(scope.is_cancelled());
+    }
 }
