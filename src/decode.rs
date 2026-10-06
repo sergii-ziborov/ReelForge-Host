@@ -1,7 +1,7 @@
 //! Host ffmpeg decode: probe + RGB frames. No libav.
 
 use crate::error::{HostError, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -82,6 +82,62 @@ pub struct ProxySample {
     pub pts_ticks: i64,
     /// Ticks per second for [`Self::pts_ticks`].
     pub timescale: u32,
+}
+
+/// Which source frames an analysis sample actually observed.
+///
+/// A lower sample rate or a frame cap is coverage, not a claim that the missing
+/// source frames were seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SampleCoverage {
+    /// Requested analysis rate. This is not the source frame rate.
+    pub sample_fps: u32,
+    /// Applied frame cap.
+    pub max_frames: u32,
+    /// The source would have produced more samples than [`Self::max_frames`].
+    pub hit_cap: bool,
+    /// Source frame numbers in sample order. A gap was not observed.
+    pub source_index: Vec<u64>,
+    /// True when every source frame in the probed duration was observed.
+    ///
+    /// False when the duration is unknown, the cap stopped the extract, or
+    /// [`Self::source_index`] is not `0, 1, 2, …` with no gaps.
+    pub covers_every_source_frame: bool,
+}
+
+/// Coverage of `pictures` against a probed source duration.
+///
+/// `duration_secs` that is not finite and positive leaves the cap unknown and
+/// does not claim full coverage.
+#[must_use]
+pub fn sample_coverage(
+    pictures: &[SampledPicture],
+    sample_fps: u32,
+    max_frames: u32,
+    duration_secs: f64,
+) -> SampleCoverage {
+    let source_index: Vec<u64> = pictures
+        .iter()
+        .map(|picture| picture.source_index)
+        .collect();
+    let expected = expected_sample_count(duration_secs, sample_fps);
+    let hit_cap = expected.is_some_and(|count| count > u64::from(max_frames));
+    let contiguous = source_index
+        .iter()
+        .enumerate()
+        .all(|(offset, source)| u64::try_from(offset).ok() == Some(*source));
+    let covers_every_source_frame = expected
+        .is_some_and(|count| u64::try_from(source_index.len()).ok() == Some(count))
+        && !hit_cap
+        && contiguous
+        && !source_index.is_empty();
+    SampleCoverage {
+        sample_fps,
+        max_frames,
+        hit_cap,
+        source_index,
+        covers_every_source_frame,
+    }
 }
 
 /// Source time to the extracted frame that covers it.
@@ -836,13 +892,17 @@ fn apply_source_pts<T: MutableTiming>(frames: &mut [T], source_pts: &[f64]) -> R
     Ok(())
 }
 
-#[allow(clippy::cast_sign_loss)]
 fn expected_samples(video: &Path, sample_fps: u32) -> Option<u64> {
     let info = probe_video(video).ok()?;
-    if !(info.duration_secs.is_finite() && info.duration_secs > 0.0) {
+    expected_sample_count(info.duration_secs, sample_fps)
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn expected_sample_count(duration_secs: f64, sample_fps: u32) -> Option<u64> {
+    if !(duration_secs.is_finite() && duration_secs > 0.0) {
         return None;
     }
-    let count = (info.duration_secs * f64::from(sample_fps)).round();
+    let count = (duration_secs * f64::from(sample_fps)).round();
     if count < 1.0 {
         Some(1)
     } else {
@@ -1345,6 +1405,50 @@ mod tests {
             vec![0, 100_000, 200_000]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_names_the_source_frames_that_were_observed() {
+        let gapped = [
+            coverage_picture(0, 0),
+            coverage_picture(1, 3),
+            coverage_picture(2, 6),
+        ];
+        let capped = sample_coverage(&gapped, 10, 3, 1.0);
+        assert!(capped.hit_cap);
+        assert!(!capped.covers_every_source_frame);
+        assert_eq!(capped.source_index, vec![0, 3, 6]);
+
+        let partial = sample_coverage(&gapped, 10, 30, 1.0);
+        assert!(!partial.hit_cap);
+        assert!(!partial.covers_every_source_frame);
+
+        let every = [
+            coverage_picture(0, 0),
+            coverage_picture(1, 1),
+            coverage_picture(2, 2),
+        ];
+        let full = sample_coverage(&every, 10, 3, 0.3);
+        assert!(!full.hit_cap);
+        assert!(full.covers_every_source_frame);
+
+        let stopped = sample_coverage(&every, 10, 3, 1.0);
+        assert!(stopped.hit_cap);
+        assert!(!stopped.covers_every_source_frame);
+
+        let unknown = sample_coverage(&every, 10, 3, f64::NAN);
+        assert!(!unknown.hit_cap);
+        assert!(!unknown.covers_every_source_frame);
+    }
+
+    fn coverage_picture(index: u64, source_index: u64) -> SampledPicture {
+        SampledPicture {
+            index,
+            source_index,
+            ticks: 0,
+            timescale: 1,
+            path: PathBuf::from("unused.png"),
+        }
     }
 
     #[test]

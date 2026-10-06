@@ -2,9 +2,9 @@
 
 use crate::compile::{photo_binding, photo_except_plan, resolve_bridge};
 use crate::decode::{
-    ExtractCancel, RGB_BATCH_FRAMES, applied_frame_cap, extract_sampled_pictures,
+    ExtractCancel, RGB_BATCH_FRAMES, SampleCoverage, applied_frame_cap, extract_sampled_pictures,
     extract_sampled_pictures_cancellable, fresh_frames_dir, materialize_video, probe_video,
-    visit_rgb_batches, visit_rgb_batches_cancellable,
+    sample_coverage, visit_rgb_batches, visit_rgb_batches_cancellable,
 };
 use crate::encode::run_graph;
 use crate::error::Result;
@@ -56,6 +56,8 @@ pub struct PrivacyExceptResult {
     pub graph: String,
     /// Frames ingested.
     pub frames: usize,
+    /// Source frames the analysis observed. A sample is not the whole file.
+    pub coverage: SampleCoverage,
     /// Peak tracks on any ingested frame.
     pub peak_tracks: usize,
     /// Detect+track+embed frames per second.
@@ -249,6 +251,12 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
         package: package.to_string_lossy().into_owned(),
         graph: bridged.graph_path.to_string_lossy().into_owned(),
         frames: pictures.len(),
+        coverage: sample_coverage(
+            &pictures,
+            opts.sample_fps.max(1),
+            max_frames,
+            info.duration_secs,
+        ),
         peak_tracks: tracks,
         ingest_fps,
         phases_ms: PhaseTimings {
@@ -273,6 +281,8 @@ fn elapsed_ms(start: Instant) -> u64 {
 pub struct IngestOnlyResult {
     /// Frames run through detect+track+embed.
     pub frames: usize,
+    /// Source frames the analysis observed. A sample is not the whole file.
+    pub coverage: SampleCoverage,
     /// Peak tracks.
     pub peak_tracks: usize,
     /// Detect+reid FPS.
@@ -311,13 +321,11 @@ pub fn ingest_only(
     })?;
     std::fs::create_dir_all(work_dir)?;
     let video = materialize_video(video, work_dir, live_secs.max(0.2))?;
+    let info = probe_video(&video)?;
     let max_frames = applied_frame_cap(max_frames);
-    let pictures = extract_sampled_pictures(
-        &video,
-        &fresh_frames_dir(work_dir),
-        sample_fps.max(1),
-        max_frames,
-    )?;
+    let sample_fps = sample_fps.max(1);
+    let pictures =
+        extract_sampled_pictures(&video, &fresh_frames_dir(work_dir), sample_fps, max_frames)?;
     let mut pipe = open_pipeline("ingest-only", models_dir)?;
     add_video_source(&mut pipe, &video);
     let mut width = 0_u32;
@@ -342,6 +350,7 @@ pub fn ingest_only(
     };
     Ok(IngestOnlyResult {
         frames: pictures.len(),
+        coverage: sample_coverage(&pictures, sample_fps, max_frames, info.duration_secs),
         peak_tracks,
         ingest_fps,
         ingest_ms,

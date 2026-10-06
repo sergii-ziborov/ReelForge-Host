@@ -3,7 +3,8 @@
 use crate::compile::{parse_redaction_kind, photo_binding, resolve_bridge};
 use crate::decode::{
     ExtractCancel, RGB_BATCH_FRAMES, applied_frame_cap, extract_sampled_pictures_cancellable,
-    fresh_frames_dir, materialize_video, probe_video, visit_rgb_batches_cancellable,
+    fresh_frames_dir, materialize_video, probe_video, sample_coverage,
+    visit_rgb_batches_cancellable,
 };
 use crate::encode::run_graph;
 use crate::error::{HostError, Result};
@@ -474,6 +475,7 @@ fn ingest_video(svc: &mut HostService, args: &Value) -> Result<Value> {
     Ok(json!({
         "frames": pictures.len(),
         "max_frames": max_frames,
+        "coverage": sample_coverage(&pictures, fps, max_frames, info.duration_secs),
         "tracks": tracks,
         "width": info.width,
         "height": info.height,
