@@ -3,8 +3,9 @@
 use crate::error::{HostError, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One decoded RGB8 frame with media time.
@@ -177,6 +178,42 @@ pub fn extract_rgb_frames(video: &Path, out_dir: &Path, sample_fps: u32) -> Resu
     extract_rgb_frames_limited(video, out_dir, sample_fps, ANALYSIS_MAX_FRAMES)
 }
 
+/// Flag a running extract can poll. Cloning shares the same flag.
+///
+/// Cancelling kills only the ffmpeg process that extract owns. Another
+/// extract, and files outside that extract's directory, stay in place.
+#[derive(Clone, Debug)]
+pub struct ExtractCancel {
+    flag: Arc<AtomicBool>,
+}
+
+impl ExtractCancel {
+    /// A flag that is not cancelled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Ask the extract that holds this flag to kill its ffmpeg process.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::cancel`] has been called.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for ExtractCancel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Extract at most `max_frames` RGB frames.
 ///
 /// ffmpeg stops at the cap, then only those PNGs are decoded. A previous
@@ -193,6 +230,26 @@ pub fn extract_rgb_frames_limited(
     sample_fps: u32,
     max_frames: u32,
 ) -> Result<Vec<RgbFrame>> {
+    extract_rgb_frames_cancellable(video, out_dir, sample_fps, max_frames, None)
+}
+
+/// Like [`extract_rgb_frames_limited`], but `cancel` kills this extract's ffmpeg.
+///
+/// A flag that is already cancelled returns before any directory is created.
+///
+/// # Errors
+///
+/// Cancellation, a zero cap, ffmpeg failure, or unreadable PNGs.
+pub fn extract_rgb_frames_cancellable(
+    video: &Path,
+    out_dir: &Path,
+    sample_fps: u32,
+    max_frames: u32,
+    cancel: Option<&ExtractCancel>,
+) -> Result<Vec<RgbFrame>> {
+    if cancel.is_some_and(ExtractCancel::is_cancelled) {
+        return Err(HostError::Ffmpeg("extract cancelled".into()));
+    }
     if max_frames == 0 {
         return Err(HostError::Ffmpeg(
             "extract refuses an unbounded frame list".into(),
@@ -208,23 +265,8 @@ pub fn extract_rgb_frames_limited(
     let pattern = out_dir.join("frame_%06d.png");
     let fps = format!("fps={sample_fps},showinfo");
     let limit = max_frames.to_string();
-    let output = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "info", "-y", "-i"])
-        .arg(video)
-        .args(["-vf", &fps, "-start_number", "0", "-frames:v", &limit])
-        .arg(&pattern)
-        .output()
-        .map_err(|e| HostError::Ffmpeg(format!("ffmpeg spawn: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail = stderr.chars().rev().take(400).collect::<String>();
-        let tail = tail.chars().rev().collect::<String>();
-        return Err(HostError::Ffmpeg(format!(
-            "ffmpeg extract frames failed ({}): {tail}",
-            output.status
-        )));
-    }
-    let source_pts = pts_times(&String::from_utf8_lossy(&output.stderr));
+    let stderr = run_ffmpeg_extract(video, &pattern, &fps, &limit, cancel)?;
+    let source_pts = pts_times(&stderr);
 
     let mut frames = Vec::new();
     let mut index = 0_u64;
@@ -275,7 +317,65 @@ pub fn extract_rgb_frames_limited(
     Ok(frames)
 }
 
-#[allow(clippy::cast_sign_loss)]
+fn run_ffmpeg_extract(
+    video: &Path,
+    pattern: &Path,
+    fps: &str,
+    limit: &str,
+    cancel: Option<&ExtractCancel>,
+) -> Result<String> {
+    if cancel.is_some_and(ExtractCancel::is_cancelled) {
+        return Err(HostError::Ffmpeg("extract cancelled".into()));
+    }
+    let log_path = pattern.with_file_name(".extract-stderr.txt");
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|err| HostError::Ffmpeg(format!("extract log: {err}")))?;
+    let mut child = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "info", "-y", "-i"])
+        .arg(video)
+        .args(["-vf", fps, "-start_number", "0", "-frames:v", limit])
+        .arg(pattern)
+        .stderr(Stdio::from(log_file))
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|err| HostError::Ffmpeg(format!("ffmpeg spawn: {err}")))?;
+    let status = match wait_ffmpeg(&mut child, cancel) {
+        Ok(status) => status,
+        Err(err) => {
+            let _ = std::fs::remove_file(&log_path);
+            return Err(err);
+        }
+    };
+    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&log_path);
+    if !status.success() {
+        let tail: String = stderr.chars().rev().take(400).collect();
+        let tail: String = tail.chars().rev().collect();
+        return Err(HostError::Ffmpeg(format!(
+            "ffmpeg extract frames failed ({status}): {tail}"
+        )));
+    }
+    Ok(stderr)
+}
+
+fn wait_ffmpeg(
+    child: &mut std::process::Child,
+    cancel: Option<&ExtractCancel>,
+) -> Result<std::process::ExitStatus> {
+    loop {
+        if cancel.is_some_and(ExtractCancel::is_cancelled) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HostError::Ffmpeg("extract cancelled".into()));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(err) => return Err(HostError::Ffmpeg(format!("ffmpeg wait: {err}"))),
+        }
+    }
+}
+
 fn pts_times(stderr: &str) -> Vec<f64> {
     let mut times = Vec::new();
     let mut rest = stderr;
@@ -643,6 +743,68 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with(&parent));
         assert!(second.starts_with(&parent));
+    }
+
+    #[test]
+    fn cancelled_extract_does_not_create_a_directory() {
+        let dir = std::env::temp_dir().join(format!("rf-host-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cancel = ExtractCancel::new();
+        cancel.cancel();
+        let err =
+            extract_rgb_frames_cancellable(Path::new("no-such.mp4"), &dir, 5, 3, Some(&cancel))
+                .unwrap_err();
+        assert!(err.to_string().contains("cancel"), "{err}");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn cancel_kills_one_ffmpeg_and_leaves_the_other() {
+        if !ffmpeg_present() {
+            return;
+        }
+        let Ok(mut cancelled) = paced_silence() else {
+            return;
+        };
+        let Ok(mut other) = paced_silence() else {
+            let _ = cancelled.kill();
+            let _ = cancelled.wait();
+            return;
+        };
+        let cancel = ExtractCancel::new();
+        cancel.cancel();
+        let err = wait_ffmpeg(&mut cancelled, Some(&cancel)).unwrap_err();
+        assert!(err.to_string().contains("cancel"), "{err}");
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "cancel must not kill the other ffmpeg"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    fn paced_silence() -> std::io::Result<std::process::Child> {
+        Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono",
+                "-af",
+                "arealtime",
+                "-t",
+                "30",
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
     }
 
     fn ffmpeg_present() -> bool {
