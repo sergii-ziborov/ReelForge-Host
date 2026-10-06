@@ -11,12 +11,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// One decoded RGB8 frame with media time.
 #[derive(Debug, Clone)]
 pub struct RgbFrame {
-    /// Zero-based extracted-frame index.
+    /// Zero-based index in the extracted sample sequence.
     pub index: u64,
+    /// Zero-based frame number in the source, before `fps` sampling.
+    ///
+    /// This is not [`Self::index`] and not [`Self::ticks`].
+    pub source_index: u64,
     /// Presentation ticks at [`Self::timescale`].
     ///
-    /// Source time from ffmpeg `showinfo` when that log is present, in
-    /// microseconds. Otherwise the sample index at `sample_fps`.
+    /// Source time from ffmpeg `showinfo` after sampling, in microseconds.
     pub ticks: i64,
     /// Ticks per second. `1_000_000` for a source presentation time.
     pub timescale: u32,
@@ -33,6 +36,8 @@ pub struct RgbFrame {
 pub struct ProxySample {
     /// Index in the extracted sequence.
     pub index: u64,
+    /// Frame number in the source, before sampling.
+    pub source_index: u64,
     /// Source presentation ticks.
     pub pts_ticks: i64,
     /// Ticks per second for [`Self::pts_ticks`].
@@ -58,6 +63,7 @@ impl ProxyMap {
                 .iter()
                 .map(|frame| ProxySample {
                     index: frame.index,
+                    source_index: frame.source_index,
                     pts_ticks: frame.ticks,
                     timescale: frame.timescale,
                 })
@@ -88,6 +94,18 @@ impl ProxyMap {
             }
         }
         best.map(|(_, index)| index)
+    }
+
+    /// Source frame number of the sample selected by [`Self::index_at`].
+    ///
+    /// `timescale == 0`, or a time before every sample, returns `None`.
+    #[must_use]
+    pub fn source_index_at(&self, ticks: i64, timescale: u32) -> Option<u64> {
+        let index = self.index_at(ticks, timescale)?;
+        self.samples
+            .iter()
+            .find(|sample| sample.index == index)
+            .map(|sample| sample.source_index)
     }
 }
 
@@ -335,10 +353,10 @@ pub fn extract_rgb_frames_cancellable(
     std::fs::create_dir_all(out_dir)?;
     clear_frame_pngs(out_dir)?;
     let pattern = out_dir.join("frame_%06d.png");
-    let fps = format!("fps={sample_fps},showinfo");
+    let fps = format!("showinfo,fps={sample_fps},showinfo");
     let limit = max_frames.to_string();
     let stderr = run_ffmpeg_extract(video, &pattern, &fps, &limit, cancel)?;
-    let source_pts = pts_times(&stderr);
+    let (before_fps, after_fps) = show_streams(&stderr)?;
 
     let mut frames = Vec::new();
     let mut index = 0_u64;
@@ -353,6 +371,7 @@ pub fn extract_rgb_frames_cancellable(
             .map_err(|e| HostError::Ffmpeg(format!("decode {}: {e}", path.display())))?;
         frames.push(RgbFrame {
             index,
+            source_index: index,
             ticks: i64::try_from(index).unwrap_or(0),
             timescale: sample_fps,
             width: decoded.width,
@@ -375,7 +394,11 @@ pub fn extract_rgb_frames_cancellable(
             "ffmpeg wrote no frames (empty or unreadable video)".into(),
         ));
     }
-    apply_source_pts(&mut frames, &source_pts);
+    let after_fps = written_showinfo(&after_fps, frames.len())?;
+    let sampled_pts: Vec<f64> = after_fps.iter().map(|frame| frame.pts_time).collect();
+    apply_source_pts(&mut frames, &sampled_pts)?;
+    let indexes = source_indexes(&before_fps, &after_fps)?;
+    apply_source_index(&mut frames, &indexes)?;
     let proxy = ProxyMap::from_frames(&frames);
     let names = frame_png_names(index);
     let manifest = serde_json::json!({
@@ -385,8 +408,10 @@ pub fn extract_rgb_frames_cancellable(
         "sample_fps": sample_fps,
         "timescale": frames[0].timescale,
         "pts_ticks": frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
+        "source_index": frames.iter().map(|frame| frame.source_index).collect::<Vec<_>>(),
         "proxy": proxy.samples.iter().map(|sample| serde_json::json!({
             "index": sample.index,
+            "source_index": sample.source_index,
             "pts_ticks": sample.pts_ticks,
             "timescale": sample.timescale,
         })).collect::<Vec<_>>(),
@@ -455,25 +480,135 @@ fn wait_ffmpeg(
     }
 }
 
-fn pts_times(stderr: &str) -> Vec<f64> {
-    let mut times = Vec::new();
-    let mut rest = stderr;
-    while let Some(pos) = rest.find("pts_time:") {
-        let after = &rest[pos + "pts_time:".len()..];
-        let token = after.split_whitespace().next().unwrap_or("");
-        if let Ok(value) = token.parse::<f64>()
-            && value.is_finite()
-            && value >= 0.0
-        {
-            times.push(value);
-        }
-        rest = if token.is_empty() {
-            ""
-        } else {
-            &after[token.len()..]
-        };
+#[derive(Clone, Copy)]
+struct ShowFrame {
+    n: u64,
+    pts_time: f64,
+}
+
+/// The encoder can log one frame past the pictures `-frames:v` actually wrote.
+fn written_showinfo(notes: &[ShowFrame], written: usize) -> Result<Vec<ShowFrame>> {
+    if notes.len() != written && notes.len() != written.saturating_add(1) {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a presentation time that does not match the pictures".into(),
+        ));
     }
-    times
+    Ok(notes.iter().take(written).copied().collect())
+}
+
+fn show_streams(stderr: &str) -> Result<(Vec<ShowFrame>, Vec<ShowFrame>)> {
+    let groups = showinfo_groups(stderr);
+    let mut groups = groups.into_iter();
+    let Some(before_fps) = groups.next() else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a frame log with no source index".into(),
+        ));
+    };
+    let Some(after_fps) = groups.next() else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a frame log with no source index".into(),
+        ));
+    };
+    if groups.next().is_some() || before_fps.is_empty() || after_fps.is_empty() {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a frame log with no source index".into(),
+        ));
+    }
+    Ok((before_fps, after_fps))
+}
+
+fn showinfo_groups(stderr: &str) -> Vec<Vec<ShowFrame>> {
+    let mut order = Vec::new();
+    let mut groups = Vec::new();
+    for line in stderr.lines() {
+        let Some(id) = showinfo_instance(line) else {
+            continue;
+        };
+        let slot = if let Some(pos) = order.iter().position(|seen| *seen == id) {
+            pos
+        } else {
+            order.push(id);
+            groups.push(Vec::new());
+            order.len() - 1
+        };
+        if let Some(frame) = showinfo_frame(line) {
+            groups[slot].push(frame);
+        }
+    }
+    groups
+}
+
+fn showinfo_instance(line: &str) -> Option<u32> {
+    let pos = line.find("showinfo_")?;
+    let rest = &line[pos + "showinfo_".len()..];
+    let end = rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn showinfo_frame(line: &str) -> Option<ShowFrame> {
+    let n_at = line.find("n:")?;
+    let n_token = line[n_at + 2..].split_whitespace().next()?;
+    let n = n_token.parse().ok()?;
+    let time_at = line.find("pts_time:")?;
+    let time_token = line[time_at + "pts_time:".len()..]
+        .split_whitespace()
+        .next()?;
+    let pts_time = time_token.parse::<f64>().ok()?;
+    if !pts_time.is_finite() || pts_time < 0.0 {
+        return None;
+    }
+    Some(ShowFrame { n, pts_time })
+}
+
+fn source_indexes(before_fps: &[ShowFrame], after_fps: &[ShowFrame]) -> Result<Vec<u64>> {
+    let mut indexes = Vec::with_capacity(after_fps.len());
+    let mut cursor = 0_usize;
+    for sample in after_fps {
+        let Some(want) = pts_ticks(sample.pts_time) else {
+            return Err(HostError::Ffmpeg(
+                "extract refuses a sample with no source frame".into(),
+            ));
+        };
+        let mut matched = None;
+        while cursor < before_fps.len() {
+            let Some(have) = pts_ticks(before_fps[cursor].pts_time) else {
+                return Err(HostError::Ffmpeg(
+                    "extract refuses a sample with no source frame".into(),
+                ));
+            };
+            let delta = i128::from(have) - i128::from(want);
+            if delta.abs() <= 2 {
+                matched = Some(before_fps[cursor].n);
+                cursor += 1;
+                break;
+            }
+            if have > want {
+                break;
+            }
+            cursor += 1;
+        }
+        let Some(index) = matched else {
+            return Err(HostError::Ffmpeg(
+                "extract refuses a sample with no source frame".into(),
+            ));
+        };
+        indexes.push(index);
+    }
+    Ok(indexes)
+}
+
+fn apply_source_index(frames: &mut [RgbFrame], indexes: &[u64]) -> Result<()> {
+    if indexes.len() != frames.len() {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a sample count that does not match the pictures".into(),
+        ));
+    }
+    for (frame, index) in frames.iter_mut().zip(indexes) {
+        frame.source_index = *index;
+    }
+    Ok(())
 }
 
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -488,14 +623,18 @@ fn pts_ticks(secs: f64) -> Option<i64> {
     Some(ticks as i64)
 }
 
-fn apply_source_pts(frames: &mut [RgbFrame], source_pts: &[f64]) {
-    if source_pts.len() < frames.len() {
-        return;
+fn apply_source_pts(frames: &mut [RgbFrame], source_pts: &[f64]) -> Result<()> {
+    if source_pts.len() != frames.len() {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a presentation time that does not match the pictures".into(),
+        ));
     }
     let mut timed = Vec::with_capacity(frames.len());
-    for secs in source_pts.iter().take(frames.len()) {
+    for secs in source_pts {
         let Some(ticks) = pts_ticks(*secs) else {
-            return;
+            return Err(HostError::Ffmpeg(
+                "extract refuses a presentation time that does not match the pictures".into(),
+            ));
         };
         timed.push(ticks);
     }
@@ -503,6 +642,7 @@ fn apply_source_pts(frames: &mut [RgbFrame], source_pts: &[f64]) {
         frame.ticks = ticks;
         frame.timescale = SOURCE_PTS_TIMESCALE;
     }
+    Ok(())
 }
 
 #[allow(clippy::cast_sign_loss)]
@@ -805,6 +945,17 @@ mod tests {
             frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
             vec![0, 100_000, 200_000]
         );
+        assert_eq!(
+            frames.iter().map(|frame| frame.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.source_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         let proxy = ProxyMap::from_frames(&frames);
         assert_eq!(proxy.index_at(150_000, 1_000_000), Some(1));
         assert_eq!(manifest["proxy"].as_array().map(Vec::len), Some(3));
@@ -910,12 +1061,90 @@ mod tests {
     fn proxy_frame(index: u64, ticks: i64) -> RgbFrame {
         RgbFrame {
             index,
+            source_index: index,
             ticks,
             timescale: 1_000_000,
             width: 1,
             height: 1,
             rgb: vec![0, 0, 0],
         }
+    }
+
+    #[test]
+    fn source_index_is_not_the_sample_or_the_pts() {
+        let log = "\
+[Parsed_showinfo_0 @ 1] config in time_base: 1/30, frame_rate: 30/1
+[Parsed_showinfo_2 @ 1] config in time_base: 1/10, frame_rate: 10/1
+[Parsed_showinfo_0 @ 1] n:   0 pts: 0 pts_time:0 duration: 1 duration_time:0.0333333
+[Parsed_showinfo_2 @ 1] n:   0 pts: 0 pts_time:0 duration: 1 duration_time:0.1
+[Parsed_showinfo_0 @ 1] n:   3 pts: 3 pts_time:0.1 duration: 1 duration_time:0.0333333
+[Parsed_showinfo_2 @ 1] n:   1 pts: 1 pts_time:0.1 duration: 1 duration_time:0.1
+[Parsed_showinfo_0 @ 1] n:   6 pts: 6 pts_time:0.2 duration: 1 duration_time:0.0333333
+[Parsed_showinfo_2 @ 1] n:   2 pts: 2 pts_time:0.2 duration: 1 duration_time:0.1
+";
+        let (before_fps, after_fps) = show_streams(log).unwrap();
+        let indexes = source_indexes(&before_fps, &after_fps).unwrap();
+        assert_eq!(indexes, vec![0, 3, 6]);
+        assert_eq!(
+            after_fps.iter().map(|frame| frame.n).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        let mut frames = [
+            proxy_frame(0, 0),
+            proxy_frame(1, 100_000),
+            proxy_frame(2, 200_000),
+        ];
+        apply_source_index(&mut frames, &indexes).unwrap();
+        let map = ProxyMap::from_frames(&frames);
+        assert_eq!(map.index_at(150_000, 1_000_000), Some(1));
+        assert_eq!(map.source_index_at(150_000, 1_000_000), Some(3));
+        assert_ne!(map.source_index_at(150_000, 1_000_000), Some(1));
+    }
+
+    #[test]
+    fn decimated_extract_keeps_the_source_frame_number() {
+        if !ffmpeg_present() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rf-host-srcidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("src.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=16x16:r=30:d=1",
+                "-frames:v",
+                "30",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let frames_dir = dir.join("frames");
+        let frames = extract_rgb_frames_limited(&video, &frames_dir, 10, 3).unwrap();
+        assert_eq!(
+            frames.iter().map(|frame| frame.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.source_index)
+                .collect::<Vec<_>>(),
+            vec![0, 3, 6]
+        );
+        assert_eq!(
+            frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
+            vec![0, 100_000, 200_000]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn ffmpeg_present() -> bool {

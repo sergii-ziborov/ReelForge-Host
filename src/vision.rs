@@ -99,7 +99,7 @@ pub fn ingest_frames_strided(
         );
         let pts = MediaTime::new(frame.ticks, frame.timescale)
             .map_err(|e| HostError::SightLoom(format!("pts: {e:?}")))?;
-        let stamp = FrameStamp::new(SourceId(1), frame.index, pts, None);
+        let stamp = FrameStamp::new(SourceId(1), frame.source_index, pts, None);
         let tracked = if frame.index.is_multiple_of(u64::from(stride)) {
             pipe.ingest_frame(stamp, &view)
                 .map_err(|e| HostError::SightLoom(e.to_string()))?
