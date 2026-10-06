@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/ReelForge-Intelligence
-          ref: 8416ef7e6ca7da38759c096723cd79a33774c44c
+          ref: 8e3764576f263b58a59badbccc1b0d0badd72372
           path: ReelForge-Intelligence
       - name: checkout Capture sibling
         uses: actions/checkout@v4
