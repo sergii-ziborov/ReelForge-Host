@@ -28,6 +28,78 @@ pub struct RgbFrame {
     pub rgb: Vec<u8>,
 }
 
+/// One analysis sample and the source time it covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxySample {
+    /// Index in the extracted sequence.
+    pub index: u64,
+    /// Source presentation ticks.
+    pub pts_ticks: i64,
+    /// Ticks per second for [`Self::pts_ticks`].
+    pub timescale: u32,
+}
+
+/// Source time to the extracted frame that covers it.
+///
+/// A time between samples holds the earlier sample. The map is the analysis
+/// coverage, not every frame of the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyMap {
+    /// Samples in extract order.
+    pub samples: Vec<ProxySample>,
+}
+
+impl ProxyMap {
+    /// Build the map from extracted frames. The RGB buffers are not copied.
+    #[must_use]
+    pub fn from_frames(frames: &[RgbFrame]) -> Self {
+        Self {
+            samples: frames
+                .iter()
+                .map(|frame| ProxySample {
+                    index: frame.index,
+                    pts_ticks: frame.ticks,
+                    timescale: frame.timescale,
+                })
+                .collect(),
+        }
+    }
+
+    /// Extracted index of the last sample at or before `ticks`.
+    ///
+    /// `timescale == 0`, or a time before every sample, returns `None`.
+    #[must_use]
+    pub fn index_at(&self, ticks: i64, timescale: u32) -> Option<u64> {
+        if timescale == 0 {
+            return None;
+        }
+        let mut best: Option<(i128, u64)> = None;
+        for sample in &self.samples {
+            let Some(sample_ticks) = rescale_ticks(sample.pts_ticks, sample.timescale, timescale)
+            else {
+                continue;
+            };
+            if sample_ticks > i128::from(ticks) {
+                continue;
+            }
+            match best {
+                Some((prev, _)) if prev > sample_ticks => {}
+                _ => best = Some((sample_ticks, sample.index)),
+            }
+        }
+        best.map(|(_, index)| index)
+    }
+}
+
+fn rescale_ticks(ticks: i64, from: u32, to: u32) -> Option<i128> {
+    if from == 0 || to == 0 {
+        return None;
+    }
+    i128::from(ticks)
+        .checked_mul(i128::from(to))?
+        .checked_div(i128::from(from))
+}
+
 /// Video probe summary.
 #[derive(Debug, Clone)]
 pub struct VideoInfo {
@@ -304,13 +376,20 @@ pub fn extract_rgb_frames_cancellable(
         ));
     }
     apply_source_pts(&mut frames, &source_pts);
+    let proxy = ProxyMap::from_frames(&frames);
     let names = frame_png_names(index);
     let manifest = serde_json::json!({
         "frames": names,
         "max_frames": max_frames,
         "hit_cap": hit_cap,
+        "sample_fps": sample_fps,
         "timescale": frames[0].timescale,
         "pts_ticks": frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
+        "proxy": proxy.samples.iter().map(|sample| serde_json::json!({
+            "index": sample.index,
+            "pts_ticks": sample.pts_ticks,
+            "timescale": sample.timescale,
+        })).collect::<Vec<_>>(),
     });
     std::fs::write(out_dir.join("frames.json"), manifest.to_string())
         .map_err(|e| HostError::Ffmpeg(format!("frame manifest: {e}")))?;
@@ -726,6 +805,10 @@ mod tests {
             frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
             vec![0, 100_000, 200_000]
         );
+        let proxy = ProxyMap::from_frames(&frames);
+        assert_eq!(proxy.index_at(150_000, 1_000_000), Some(1));
+        assert_eq!(manifest["proxy"].as_array().map(Vec::len), Some(3));
+        assert_eq!(manifest["sample_fps"], 10);
         let other = fresh_frames_dir(&dir);
         let again = extract_rgb_frames_limited(&video, &other, 10, 3).unwrap();
         assert_eq!(again.len(), 3);
@@ -805,6 +888,34 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
+    }
+
+    #[test]
+    fn proxy_map_holds_the_previous_sample() {
+        let frames = [
+            proxy_frame(0, 0),
+            proxy_frame(1, 100_000),
+            proxy_frame(2, 200_000),
+        ];
+        let map = ProxyMap::from_frames(&frames);
+        assert_eq!(map.index_at(-1, 1_000_000), None);
+        assert_eq!(map.index_at(0, 1_000_000), Some(0));
+        assert_eq!(map.index_at(150_000, 1_000_000), Some(1));
+        assert_eq!(map.index_at(200_000, 1_000_000), Some(2));
+        assert_eq!(map.index_at(1, 10), Some(1));
+        assert_eq!(map.index_at(0, 0), None);
+        assert!(ProxyMap::from_frames(&[]).index_at(0, 1_000_000).is_none());
+    }
+
+    fn proxy_frame(index: u64, ticks: i64) -> RgbFrame {
+        RgbFrame {
+            index,
+            ticks,
+            timescale: 1_000_000,
+            width: 1,
+            height: 1,
+            rgb: vec![0, 0, 0],
+        }
     }
 
     fn ffmpeg_present() -> bool {
