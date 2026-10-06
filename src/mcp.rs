@@ -2,7 +2,8 @@
 
 use crate::compile::{parse_redaction_kind, photo_binding, resolve_bridge};
 use crate::decode::{
-    applied_frame_cap, extract_rgb_frames_limited, fresh_frames_dir, materialize_video, probe_video,
+    RGB_BATCH_FRAMES, applied_frame_cap, extract_sampled_pictures, fresh_frames_dir,
+    materialize_video, probe_video, visit_rgb_batches,
 };
 use crate::encode::run_graph;
 use crate::error::{HostError, Result};
@@ -310,16 +311,20 @@ fn ingest_video(svc: &mut HostService, args: &Value) -> Result<Value> {
     let video = materialize_video(&video, &work, live_secs)?;
     let info = probe_video(&video)?;
     let frames_dir = fresh_frames_dir(&work);
-    let frames = extract_rgb_frames_limited(&video, &frames_dir, fps, max_frames)?;
+    let pictures = extract_sampled_pictures(&video, &frames_dir, fps, max_frames)?;
     let pipe = svc.ensure_pipe()?;
     add_video_source(pipe, &video);
-    let tracks = ingest_frames(pipe, &frames)?;
+    let mut tracks = 0_usize;
+    visit_rgb_batches(&pictures, RGB_BATCH_FRAMES, |batch| {
+        tracks = tracks.max(ingest_frames(pipe, batch)?);
+        Ok(())
+    })?;
     let package = work.join("vision_index");
     save_package(pipe, &package)?;
     svc.last_package = Some(package.clone());
     svc.work_dir = work;
     Ok(json!({
-        "frames": frames.len(),
+        "frames": pictures.len(),
         "max_frames": max_frames,
         "tracks": tracks,
         "width": info.width,

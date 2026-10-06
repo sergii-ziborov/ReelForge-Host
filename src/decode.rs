@@ -8,6 +8,46 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// One sampled picture on disk. The RGB bytes stay in the PNG until loaded.
+#[derive(Debug, Clone)]
+pub struct SampledPicture {
+    /// Zero-based index in the extracted sample sequence.
+    pub index: u64,
+    /// Zero-based frame number in the source, before `fps` sampling.
+    pub source_index: u64,
+    /// Presentation ticks at [`Self::timescale`].
+    pub ticks: i64,
+    /// Ticks per second. `1_000_000` for a source presentation time.
+    pub timescale: u32,
+    path: PathBuf,
+}
+
+impl SampledPicture {
+    /// Decode this picture. The buffer lives only as long as the caller keeps it.
+    ///
+    /// # Errors
+    ///
+    /// The PNG is missing or not RGB.
+    pub fn load(&self) -> Result<RgbFrame> {
+        let bytes = std::fs::read(&self.path)
+            .map_err(|err| HostError::Ffmpeg(format!("read {}: {err}", self.path.display())))?;
+        let decoded = sightloom_host::decode_encoded_rgb(&bytes)
+            .map_err(|err| HostError::Ffmpeg(format!("decode {}: {err}", self.path.display())))?;
+        Ok(RgbFrame {
+            index: self.index,
+            source_index: self.source_index,
+            ticks: self.ticks,
+            timescale: self.timescale,
+            width: decoded.width,
+            height: decoded.height,
+            rgb: decoded.rgb,
+        })
+    }
+}
+
+/// How many RGB frames a batch visitor holds at once.
+pub const RGB_BATCH_FRAMES: usize = 8;
+
 /// One decoded RGB8 frame with media time.
 #[derive(Debug, Clone)]
 pub struct RgbFrame {
@@ -58,14 +98,37 @@ impl ProxyMap {
     /// Build the map from extracted frames. The RGB buffers are not copied.
     #[must_use]
     pub fn from_frames(frames: &[RgbFrame]) -> Self {
+        Self::from_timed(frames.iter().map(|frame| {
+            (
+                frame.index,
+                frame.source_index,
+                frame.ticks,
+                frame.timescale,
+            )
+        }))
+    }
+
+    /// Build the map from pictures that are still stored as PNG.
+    #[must_use]
+    pub fn from_pictures(pictures: &[SampledPicture]) -> Self {
+        Self::from_timed(pictures.iter().map(|picture| {
+            (
+                picture.index,
+                picture.source_index,
+                picture.ticks,
+                picture.timescale,
+            )
+        }))
+    }
+
+    fn from_timed(timed: impl Iterator<Item = (u64, u64, i64, u32)>) -> Self {
         Self {
-            samples: frames
-                .iter()
-                .map(|frame| ProxySample {
-                    index: frame.index,
-                    source_index: frame.source_index,
-                    pts_ticks: frame.ticks,
-                    timescale: frame.timescale,
+            samples: timed
+                .map(|(index, source_index, pts_ticks, timescale)| ProxySample {
+                    index,
+                    source_index,
+                    pts_ticks,
+                    timescale,
                 })
                 .collect(),
         }
@@ -304,12 +367,11 @@ impl Default for ExtractCancel {
     }
 }
 
-/// Extract at most `max_frames` RGB frames.
+/// Extract at most `max_frames` RGB frames into one vector.
 ///
-/// ffmpeg stops at the cap, then only those PNGs are decoded. A previous
-/// `frame_*.png` tail is removed first. `frames.json` records `max_frames`
-/// and `hit_cap` when the source is longer than the cap. `max_frames == 0`
-/// is refused before any file is written.
+/// Analysis callers should use [`extract_sampled_pictures`] and
+/// [`visit_rgb_batches`] so the RGB buffers stay in batches of
+/// [`RGB_BATCH_FRAMES`]. This function still decodes every kept picture.
 ///
 /// # Errors
 ///
@@ -337,6 +399,46 @@ pub fn extract_rgb_frames_cancellable(
     max_frames: u32,
     cancel: Option<&ExtractCancel>,
 ) -> Result<Vec<RgbFrame>> {
+    let pictures =
+        extract_sampled_pictures_cancellable(video, out_dir, sample_fps, max_frames, cancel)?;
+    let mut frames = Vec::with_capacity(pictures.len());
+    let batch = pictures.len().max(1);
+    visit_rgb_batches(&pictures, batch, |chunk| {
+        frames.extend(chunk.iter().cloned());
+        Ok(())
+    })?;
+    Ok(frames)
+}
+
+/// List capped pictures without decoding them into one RGB vector.
+///
+/// ffmpeg still stops at `max_frames`. PNG tails are removed. `frames.json`
+/// records the cap. Call [`visit_rgb_batches`] to decode a few pictures at a time.
+///
+/// # Errors
+///
+/// A zero cap, ffmpeg failure, or a showinfo log that cannot be paired.
+pub fn extract_sampled_pictures(
+    video: &Path,
+    out_dir: &Path,
+    sample_fps: u32,
+    max_frames: u32,
+) -> Result<Vec<SampledPicture>> {
+    extract_sampled_pictures_cancellable(video, out_dir, sample_fps, max_frames, None)
+}
+
+/// Like [`extract_sampled_pictures`], but `cancel` kills this extract's ffmpeg.
+///
+/// # Errors
+///
+/// Cancellation, a zero cap, ffmpeg failure, or a showinfo log that cannot be paired.
+pub fn extract_sampled_pictures_cancellable(
+    video: &Path,
+    out_dir: &Path,
+    sample_fps: u32,
+    max_frames: u32,
+    cancel: Option<&ExtractCancel>,
+) -> Result<Vec<SampledPicture>> {
     if cancel.is_some_and(ExtractCancel::is_cancelled) {
         return Err(HostError::Ffmpeg("extract cancelled".into()));
     }
@@ -358,7 +460,7 @@ pub fn extract_rgb_frames_cancellable(
     let stderr = run_ffmpeg_extract(video, &pattern, &fps, &limit, cancel)?;
     let (before_fps, after_fps) = show_streams(&stderr)?;
 
-    let mut frames = Vec::new();
+    let mut pictures = Vec::new();
     let mut index = 0_u64;
     let cap = u64::from(max_frames);
     while index < cap {
@@ -366,17 +468,12 @@ pub fn extract_rgb_frames_cancellable(
         if !path.is_file() {
             break;
         }
-        let bytes = std::fs::read(&path)?;
-        let decoded = sightloom_host::decode_encoded_rgb(&bytes)
-            .map_err(|e| HostError::Ffmpeg(format!("decode {}: {e}", path.display())))?;
-        frames.push(RgbFrame {
+        pictures.push(SampledPicture {
             index,
             source_index: index,
             ticks: i64::try_from(index).unwrap_or(0),
             timescale: sample_fps,
-            width: decoded.width,
-            height: decoded.height,
-            rgb: decoded.rgb,
+            path,
         });
         index += 1;
     }
@@ -389,26 +486,66 @@ pub fn extract_rgb_frames_cancellable(
         std::fs::remove_file(&path)?;
         extra += 1;
     }
-    if frames.is_empty() {
+    if pictures.is_empty() {
         return Err(HostError::Ffmpeg(
             "ffmpeg wrote no frames (empty or unreadable video)".into(),
         ));
     }
-    let after_fps = written_showinfo(&after_fps, frames.len())?;
+    let after_fps = written_showinfo(&after_fps, pictures.len())?;
     let sampled_pts: Vec<f64> = after_fps.iter().map(|frame| frame.pts_time).collect();
-    apply_source_pts(&mut frames, &sampled_pts)?;
+    apply_source_pts(&mut pictures, &sampled_pts)?;
     let indexes = source_indexes(&before_fps, &after_fps)?;
-    apply_source_index(&mut frames, &indexes)?;
-    let proxy = ProxyMap::from_frames(&frames);
-    let names = frame_png_names(index);
+    apply_source_index(&mut pictures, &indexes)?;
+    write_frame_manifest(out_dir, max_frames, hit_cap, sample_fps, &pictures)?;
+    Ok(pictures)
+}
+
+/// Decode `pictures` a few at a time. Each slice passed to `visit` has at most `batch` frames.
+///
+/// The RGB buffers are dropped before the next slice is decoded.
+///
+/// # Errors
+///
+/// `batch == 0`, a PNG that cannot be decoded, or an error from `visit`.
+pub fn visit_rgb_batches(
+    pictures: &[SampledPicture],
+    batch: usize,
+    mut visit: impl FnMut(&[RgbFrame]) -> Result<()>,
+) -> Result<()> {
+    if batch == 0 {
+        return Err(HostError::Ffmpeg(
+            "extract refuses an empty rgb batch".into(),
+        ));
+    }
+    let mut held = Vec::with_capacity(batch.min(pictures.len()));
+    for chunk in pictures.chunks(batch) {
+        held.clear();
+        for picture in chunk {
+            held.push(picture.load()?);
+        }
+        visit(&held)?;
+        held.clear();
+    }
+    Ok(())
+}
+
+fn write_frame_manifest(
+    out_dir: &Path,
+    max_frames: u32,
+    hit_cap: bool,
+    sample_fps: u32,
+    pictures: &[SampledPicture],
+) -> Result<()> {
+    let proxy = ProxyMap::from_pictures(pictures);
+    let names = frame_png_names(u64::try_from(pictures.len()).unwrap_or(u64::MAX));
     let manifest = serde_json::json!({
         "frames": names,
         "max_frames": max_frames,
         "hit_cap": hit_cap,
         "sample_fps": sample_fps,
-        "timescale": frames[0].timescale,
-        "pts_ticks": frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
-        "source_index": frames.iter().map(|frame| frame.source_index).collect::<Vec<_>>(),
+        "timescale": pictures[0].timescale,
+        "pts_ticks": pictures.iter().map(|picture| picture.ticks).collect::<Vec<_>>(),
+        "source_index": pictures.iter().map(|picture| picture.source_index).collect::<Vec<_>>(),
         "proxy": proxy.samples.iter().map(|sample| serde_json::json!({
             "index": sample.index,
             "source_index": sample.source_index,
@@ -417,8 +554,7 @@ pub fn extract_rgb_frames_cancellable(
         })).collect::<Vec<_>>(),
     });
     std::fs::write(out_dir.join("frames.json"), manifest.to_string())
-        .map_err(|e| HostError::Ffmpeg(format!("frame manifest: {e}")))?;
-    Ok(frames)
+        .map_err(|err| HostError::Ffmpeg(format!("frame manifest: {err}")))
 }
 
 fn run_ffmpeg_extract(
@@ -601,14 +737,41 @@ fn source_indexes(before_fps: &[ShowFrame], after_fps: &[ShowFrame]) -> Result<V
     Ok(indexes)
 }
 
-fn apply_source_index(frames: &mut [RgbFrame], indexes: &[u64]) -> Result<()> {
+trait MutableTiming {
+    fn write_ticks(&mut self, ticks: i64, timescale: u32);
+    fn write_source_index(&mut self, index: u64);
+}
+
+impl MutableTiming for RgbFrame {
+    fn write_ticks(&mut self, ticks: i64, timescale: u32) {
+        self.ticks = ticks;
+        self.timescale = timescale;
+    }
+
+    fn write_source_index(&mut self, index: u64) {
+        self.source_index = index;
+    }
+}
+
+impl MutableTiming for SampledPicture {
+    fn write_ticks(&mut self, ticks: i64, timescale: u32) {
+        self.ticks = ticks;
+        self.timescale = timescale;
+    }
+
+    fn write_source_index(&mut self, index: u64) {
+        self.source_index = index;
+    }
+}
+
+fn apply_source_index<T: MutableTiming>(frames: &mut [T], indexes: &[u64]) -> Result<()> {
     if indexes.len() != frames.len() {
         return Err(HostError::Ffmpeg(
             "extract refuses a sample count that does not match the pictures".into(),
         ));
     }
     for (frame, index) in frames.iter_mut().zip(indexes) {
-        frame.source_index = *index;
+        frame.write_source_index(*index);
     }
     Ok(())
 }
@@ -625,7 +788,7 @@ fn pts_ticks(secs: f64) -> Option<i64> {
     Some(ticks as i64)
 }
 
-fn apply_source_pts(frames: &mut [RgbFrame], source_pts: &[f64]) -> Result<()> {
+fn apply_source_pts<T: MutableTiming>(frames: &mut [T], source_pts: &[f64]) -> Result<()> {
     if source_pts.len() != frames.len() {
         return Err(HostError::Ffmpeg(
             "extract refuses a presentation time that does not match the pictures".into(),
@@ -641,8 +804,7 @@ fn apply_source_pts(frames: &mut [RgbFrame], source_pts: &[f64]) -> Result<()> {
         timed.push(ticks);
     }
     for (frame, ticks) in frames.iter_mut().zip(timed) {
-        frame.ticks = ticks;
-        frame.timescale = SOURCE_PTS_TIMESCALE;
+        frame.write_ticks(ticks, SOURCE_PTS_TIMESCALE);
     }
     Ok(())
 }
@@ -1155,6 +1317,68 @@ mod tests {
             frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
             vec![0, 100_000, 200_000]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn visit_refuses_an_empty_rgb_batch() {
+        let err = visit_rgb_batches(&[], 0, |_| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("refuses"), "{err}");
+    }
+
+    #[test]
+    fn rgb_batches_drop_each_chunk() {
+        if !ffmpeg_present() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rf-host-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("src.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=green:s=16x16:r=10:d=1",
+                "-frames:v",
+                "3",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let frames_dir = dir.join("frames");
+        let pictures = extract_sampled_pictures(&video, &frames_dir, 10, 3).unwrap();
+        assert_eq!(pictures.len(), 3);
+        let mut lengths = Vec::new();
+        visit_rgb_batches(&pictures, 2, |chunk| {
+            lengths.push(chunk.len());
+            assert!(chunk.len() <= 2);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(lengths, vec![2, 1]);
+        let mut indexes = Vec::new();
+        let mut source = Vec::new();
+        let mut ticks = Vec::new();
+        visit_rgb_batches(&pictures, 2, |chunk| {
+            for frame in chunk {
+                indexes.push(frame.index);
+                source.push(frame.source_index);
+                ticks.push(frame.ticks);
+                assert_eq!(frame.rgb.len(), 16 * 16 * 3);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(indexes, vec![0, 1, 2]);
+        assert_eq!(source, vec![0, 1, 2]);
+        assert_eq!(ticks, vec![0, 100_000, 200_000]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

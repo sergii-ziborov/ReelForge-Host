@@ -2,7 +2,8 @@
 
 use crate::compile::{photo_binding, photo_except_plan, resolve_bridge};
 use crate::decode::{
-    applied_frame_cap, extract_rgb_frames_limited, fresh_frames_dir, materialize_video, probe_video,
+    RGB_BATCH_FRAMES, applied_frame_cap, extract_sampled_pictures, fresh_frames_dir,
+    materialize_video, probe_video, visit_rgb_batches,
 };
 use crate::encode::run_graph;
 use crate::error::Result;
@@ -119,14 +120,14 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
         video.display(),
     );
     let t_extract = Instant::now();
-    let frames = extract_rgb_frames_limited(
+    let pictures = extract_sampled_pictures(
         &video,
         &fresh_frames_dir(&opts.work_dir),
         opts.sample_fps.max(1),
         max_frames,
     )?;
     let extract_ms = elapsed_ms(t_extract);
-    eprintln!("extracted {} frames in {extract_ms} ms", frames.len());
+    eprintln!("extracted {} frames in {extract_ms} ms", pictures.len());
 
     let mut pipe = open_pipeline("privacy-except", &opts.models_dir)?;
     add_video_source(&mut pipe, &video);
@@ -142,19 +143,23 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     let enroll_ms = elapsed_ms(t_enroll);
 
     let t_ingest = Instant::now();
-    let tracks = ingest_frames_strided(&mut pipe, &frames, opts.embed_every)?;
+    let mut tracks = 0_usize;
+    visit_rgb_batches(&pictures, RGB_BATCH_FRAMES, |batch| {
+        tracks = tracks.max(ingest_frames_strided(&mut pipe, batch, opts.embed_every)?);
+        Ok(())
+    })?;
     let ingest_ms = elapsed_ms(t_ingest);
     let ingest_fps = if ingest_ms == 0 {
         0.0
     } else {
-        (frames.len() as f64) * 1000.0 / ingest_ms as f64
+        (pictures.len() as f64) * 1000.0 / ingest_ms as f64
     };
     eprintln!(
         "ingested frames={} peak_tracks={tracks} in {ingest_ms} ms ({ingest_fps:.2} fps)",
-        frames.len()
+        pictures.len()
     );
 
-    let last_pts = frames
+    let last_pts = pictures
         .last()
         .and_then(|f| sightloom::core::MediaTime::new(f.ticks, f.timescale).ok())
         .ok_or_else(|| crate::error::HostError::message("no frames for identity resolve"))?;
@@ -173,7 +178,7 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
         &decoded.rgb,
         decoded.width,
         decoded.height,
-        &frames,
+        &pictures,
     )?;
     let subject_id = keep.subject_id;
     crop_track_boxes_to_faces(&mut pipe, &keep.allowed_ids);
@@ -232,7 +237,7 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
         output: written,
         package: package.to_string_lossy().into_owned(),
         graph: bridged.graph_path.to_string_lossy().into_owned(),
-        frames: frames.len(),
+        frames: pictures.len(),
         peak_tracks: tracks,
         ingest_fps,
         phases_ms: PhaseTimings {
@@ -296,25 +301,36 @@ pub fn ingest_only(
     std::fs::create_dir_all(work_dir)?;
     let video = materialize_video(video, work_dir, live_secs.max(0.2))?;
     let max_frames = applied_frame_cap(max_frames);
-    let frames = extract_rgb_frames_limited(
+    let pictures = extract_sampled_pictures(
         &video,
         &fresh_frames_dir(work_dir),
         sample_fps.max(1),
         max_frames,
     )?;
-    let (width, height) = frames.first().map_or((0, 0), |f| (f.width, f.height));
     let mut pipe = open_pipeline("ingest-only", models_dir)?;
     add_video_source(&mut pipe, &video);
+    let mut width = 0_u32;
+    let mut height = 0_u32;
+    let mut peak_tracks = 0_usize;
     let t0 = Instant::now();
-    let peak_tracks = ingest_frames_strided(&mut pipe, &frames, embed_every)?;
+    visit_rgb_batches(&pictures, RGB_BATCH_FRAMES, |batch| {
+        if let Some(frame) = batch.first()
+            && width == 0
+        {
+            width = frame.width;
+            height = frame.height;
+        }
+        peak_tracks = peak_tracks.max(ingest_frames_strided(&mut pipe, batch, embed_every)?);
+        Ok(())
+    })?;
     let ingest_ms = elapsed_ms(t0);
     let ingest_fps = if ingest_ms == 0 {
         0.0
     } else {
-        (frames.len() as f64) * 1000.0 / ingest_ms as f64
+        (pictures.len() as f64) * 1000.0 / ingest_ms as f64
     };
     Ok(IngestOnlyResult {
-        frames: frames.len(),
+        frames: pictures.len(),
         peak_tracks,
         ingest_fps,
         ingest_ms,

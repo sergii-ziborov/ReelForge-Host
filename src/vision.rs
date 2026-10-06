@@ -1,6 +1,6 @@
 //! SightLoom session: enroll photo, ingest frames, search, save package.
 
-use crate::decode::RgbFrame;
+use crate::decode::{RgbFrame, SampledPicture};
 use crate::error::{HostError, Result};
 use crate::models::{missing_weights_help, require_weights};
 use serde::Serialize;
@@ -225,9 +225,12 @@ pub fn best_video_accept(hits: &[PhotoHit]) -> Result<PhotoHit> {
 /// lets a second face through. Per frame we keep **at most one** box — Re-id
 /// plus clothing color against the still — and leave everyone else for invert.
 ///
+/// Clothing color loads one sampled PNG for that frame index and drops it.
+/// A missing picture scores `0.0`.
+///
 /// # Errors
 ///
-/// No video Accept.
+/// No video Accept, or a sampled PNG that cannot be decoded.
 #[allow(clippy::too_many_lines)]
 pub fn merge_keep_identity(
     pipe: &mut HostPipeline,
@@ -235,7 +238,7 @@ pub fn merge_keep_identity(
     photo_rgb: &[u8],
     photo_w: u32,
     photo_h: u32,
-    frames: &[RgbFrame],
+    pictures: &[SampledPicture],
 ) -> Result<KeepIdentity> {
     let seed = best_video_accept(photo_hits)?;
     let seed_key = TrackKey::new(SourceId(seed.source_id), TrackId(seed.track_id));
@@ -246,7 +249,10 @@ pub fn merge_keep_identity(
         }
         reid.insert((h.source_id, h.track_id), h.score);
     }
-    let frame_by_index: HashMap<u64, &RgbFrame> = frames.iter().map(|f| (f.index, f)).collect();
+    let picture_by_index: HashMap<u64, &SampledPicture> = pictures
+        .iter()
+        .map(|picture| (picture.index, picture))
+        .collect();
     let photo_fallback = clothing_mean(photo_rgb, photo_w, photo_h);
 
     let mut by_frame: HashMap<u64, Vec<sightloom_index::TrackSample>> = HashMap::new();
@@ -264,15 +270,15 @@ pub fn merge_keep_identity(
     }
     keep_keys.push(seed_key);
     let seed_color =
-        track_clothing_mean(&by_frame, seed_key, &frame_by_index).unwrap_or(photo_fallback);
+        track_clothing_mean(&by_frame, seed_key, &picture_by_index)?.unwrap_or(photo_fallback);
 
     let mut color_sum: HashMap<TrackKey, (f32, u32, Option<SubjectId>)> = HashMap::new();
     for (frame_index, row) in &by_frame {
-        let Some(frame) = frame_by_index.get(frame_index) else {
+        let Some(frame) = load_indexed_picture(&picture_by_index, *frame_index)? else {
             continue;
         };
         for sample in row {
-            let c = rgb_affinity(seed_color, clothing_box_mean(frame, *sample));
+            let c = rgb_affinity(seed_color, clothing_box_mean(&frame, *sample));
             let entry = color_sum
                 .entry(sample.track_key())
                 .or_insert((0.0, 0, sample.subject_id));
@@ -332,7 +338,8 @@ pub fn merge_keep_identity(
                 .get(&(key.source_id.0, key.local_track_id.0))
                 .copied()
                 .unwrap_or(0.0);
-            let color = frame_by_index.get(frame_index).map_or(0.0, |frame| {
+            let loaded = load_indexed_picture(&picture_by_index, *frame_index)?;
+            let color = loaded.as_ref().map_or(0.0, |frame| {
                 rgb_affinity(seed_color, clothing_box_mean(frame, sample))
             });
             let combined = r + COLOR_WEIGHT * color;
@@ -344,6 +351,7 @@ pub fn merge_keep_identity(
             frames_kept += 1;
             continue;
         }
+        let loaded = load_indexed_picture(&picture_by_index, *frame_index)?;
         let mut ranked: Vec<(f32, f32, f32, sightloom_index::TrackSample)> = Vec::new();
         for sample in row {
             let key = sample.track_key();
@@ -351,7 +359,7 @@ pub fn merge_keep_identity(
                 .get(&(key.source_id.0, key.local_track_id.0))
                 .copied()
                 .unwrap_or(0.0);
-            let color = frame_by_index.get(frame_index).map_or(0.0, |frame| {
+            let color = loaded.as_ref().map_or(0.0, |frame| {
                 rgb_affinity(seed_color, clothing_box_mean(frame, *sample))
             });
             ranked.push((r + COLOR_WEIGHT * color, r, color, *sample));
@@ -489,22 +497,32 @@ fn clothing_box_mean(frame: &RgbFrame, sample: sightloom_index::TrackSample) -> 
     box_mean(frame, sample.left, top, sample.right, sample.bottom)
 }
 
+fn load_indexed_picture(
+    pictures: &HashMap<u64, &SampledPicture>,
+    frame_index: u64,
+) -> Result<Option<RgbFrame>> {
+    let Some(picture) = pictures.get(&frame_index) else {
+        return Ok(None);
+    };
+    picture.load().map(Some)
+}
+
 fn track_clothing_mean(
     by_frame: &HashMap<u64, Vec<sightloom_index::TrackSample>>,
     seed: TrackKey,
-    frames: &HashMap<u64, &RgbFrame>,
-) -> Option<[f32; 3]> {
+    pictures: &HashMap<u64, &SampledPicture>,
+) -> Result<Option<[f32; 3]>> {
     let mut sum = [0.0_f32; 3];
     let mut n = 0.0_f32;
     for (frame_index, row) in by_frame {
-        let Some(frame) = frames.get(frame_index) else {
+        let Some(frame) = load_indexed_picture(pictures, *frame_index)? else {
             continue;
         };
         for sample in row {
             if sample.track_key() != seed {
                 continue;
             }
-            let c = clothing_box_mean(frame, *sample);
+            let c = clothing_box_mean(&frame, *sample);
             sum[0] += c[0];
             sum[1] += c[1];
             sum[2] += c[2];
@@ -512,9 +530,9 @@ fn track_clothing_mean(
         }
     }
     if n < 1.0 {
-        return None;
+        return Ok(None);
     }
-    Some([sum[0] / n, sum[1] / n, sum[2] / n])
+    Ok(Some([sum[0] / n, sum[1] / n, sum[2] / n]))
 }
 
 fn box_mean(frame: &RgbFrame, left: f32, top: f32, right: f32, bottom: f32) -> [f32; 3] {
