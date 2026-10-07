@@ -669,11 +669,11 @@ fn write_frame_manifest(
 }
 
 fn sample_filter(sample_fps: u32) -> String {
-    // The identity branch stamps the decoded ordinal, then runs the same `fps`
-    // filter. The picture branch does not carry that stamp. PTS equality is not
-    // used: `fps` rewrites presentation time and can repeat a frame.
+    // One `fps` keeps a frame whose alpha already holds the decoded ordinal.
+    // The picture drops that alpha. The stamp reads it from the same frame.
+    // A second `fps` does not keep the same ordinal, and PTS is not the ordinal.
     format!(
-        "split[pixsrc][idsrc];[idsrc]scale=1:1:flags=neighbor,format=rgb24,geq=r='if(gte(N,16777215),255,mod(N,256))':g='if(gte(N,16777215),255,mod(floor(N/256),256))':b='if(gte(N,16777215),255,mod(floor(N/65536),256))',fps={sample_fps}[idout];[pixsrc]fps={sample_fps},showinfo,format=rgb24[pixout]"
+        "format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(gte(N,16777215),255,if(eq(X,0)*eq(Y,0),mod(N,256),if(eq(X,1)*eq(Y,0),mod(floor(N/256),256),if(eq(X,2)*eq(Y,0),mod(floor(N/65536),256),255))))',fps={sample_fps},split[pix][id];[pix]format=rgb24,showinfo[pixout];[id]crop=3:1:0:0,geq=r='alpha(X,Y)':g='0':b='0',format=rgb24[idout]"
     )
 }
 
@@ -838,23 +838,24 @@ fn showinfo_frame(line: &str) -> Option<ShowFrame> {
 }
 
 fn read_source_stamps(path: &Path, written: usize) -> Result<Vec<u64>> {
+    // Three rgb24 pixels. The ordinal lives in R at bytes 0, 3, and 6.
+    const STAMP_STRIDE: usize = 9;
     let bytes = std::fs::read(path)
         .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))?;
-    if !bytes.len().is_multiple_of(3) {
+    if !bytes.len().is_multiple_of(STAMP_STRIDE) {
         return Err(HostError::Ffmpeg(
             "extract refuses a source frame that does not match the pictures".into(),
         ));
     }
-    let frames = bytes.len() / 3;
+    let frames = bytes.len() / STAMP_STRIDE;
     if frames < written {
         return Err(HostError::Ffmpeg(format!(
             "extract refuses a source frame that does not match the pictures: logged {frames}, wrote {written}"
         )));
     }
     let mut indexes = Vec::with_capacity(written);
-    for index in 0..written {
-        let at = index * 3;
-        indexes.push(stamp_index([bytes[at], bytes[at + 1], bytes[at + 2]])?);
+    for pixel in bytes.chunks(STAMP_STRIDE).take(written) {
+        indexes.push(stamp_index([pixel[0], pixel[3], pixel[6]])?);
     }
     Ok(indexes)
 }
@@ -1408,6 +1409,32 @@ mod tests {
         assert!(err.to_string().contains("does not fit"), "{err}");
         assert_eq!(repeat_of(&[1, 4, 7]), vec![None, None, None]);
         assert_eq!(repeat_of(&[0, 0, 1, 1]), vec![None, Some(0), None, Some(2)]);
+        let stamp_dir = std::env::temp_dir().join(format!("rf-host-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stamp_dir);
+        std::fs::create_dir_all(&stamp_dir).unwrap();
+        let stamp_path = stamp_dir.join("source-index.rgb");
+        let mut packed = vec![0_u8; 27];
+        packed[0] = 1;
+        packed[12] = 1;
+        packed[18] = 2;
+        packed[24] = 1;
+        std::fs::write(&stamp_path, &packed).unwrap();
+        assert_eq!(
+            read_source_stamps(&stamp_path, 3).unwrap(),
+            vec![1, 256, 65_538]
+        );
+        std::fs::write(&stamp_path, &packed[..18]).unwrap();
+        let Err(err) = read_source_stamps(&stamp_path, 3) else {
+            panic!("a short source stamp was accepted");
+        };
+        assert!(err.to_string().contains("logged 2"), "{err}");
+        assert!(err.to_string().contains("wrote 3"), "{err}");
+        std::fs::write(&stamp_path, &packed[..10]).unwrap();
+        let Err(err) = read_source_stamps(&stamp_path, 1) else {
+            panic!("a partial source stamp was accepted");
+        };
+        assert!(err.to_string().contains("does not match"), "{err}");
+        let _ = std::fs::remove_dir_all(&stamp_dir);
         let one = "\
 [Parsed_showinfo_1 @ 1] n:   0 pts: 0 pts_time:0
 [Parsed_showinfo_1 @ 1] n:   1 pts: 1 pts_time:0.1
@@ -1442,65 +1469,99 @@ mod tests {
         let thirty = numbered_clip(&dir, "thirty.mov", 30, 15, "");
         let frames_dir = dir.join("frames30");
         let frames = extract_rgb_frames_limited(&thirty, &frames_dir, 10, 5).unwrap();
-        assert_eq!(source_of(&frames), vec![1, 4, 7, 10, 13]);
-        assert_eq!(
-            frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
-            vec![0, 100_000, 200_000, 300_000, 400_000]
-        );
+        let sources = source_of(&frames);
+        assert_resampled(&frames);
+        assert_duplicates(&frames);
+        assert_output_ticks(&frames, 10);
         assert!(frames.iter().all(|frame| frame.duplicate_of.is_none()));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.width == 16 && frame.height == 16)
+        );
         assert!(!frames_dir.join("source-index.rgb").exists());
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(frames_dir.join("frames.json")).unwrap())
                 .unwrap();
-        assert_eq!(
-            manifest["source_index"],
-            serde_json::json!([1, 4, 7, 10, 13])
-        );
-        assert_eq!(
-            manifest["duplicate_of"],
-            serde_json::json!([null, null, null, null, null])
-        );
+        assert_eq!(manifest["source_index"], serde_json::json!(sources));
+        let duplicates: Vec<Option<u64>> = frames.iter().map(|frame| frame.duplicate_of).collect();
+        assert_eq!(manifest["duplicate_of"], serde_json::json!(duplicates));
 
         let twenty_four = numbered_clip(&dir, "twentyfour.mov", 24, 12, "");
         let from_twenty_four =
             extract_rgb_frames_limited(&twenty_four, &dir.join("frames24"), 10, 5).unwrap();
-        assert_eq!(source_of(&from_twenty_four), vec![1, 3, 5, 8, 10]);
+        source_of(&from_twenty_four);
+        assert_resampled(&from_twenty_four);
+        assert_duplicates(&from_twenty_four);
+        assert_output_ticks(&from_twenty_four, 10);
 
         let upsampled = numbered_clip(&dir, "ten.mov", 10, 5, "");
         let doubled = extract_rgb_frames_limited(&upsampled, &dir.join("frames20"), 20, 8).unwrap();
-        assert_eq!(source_of(&doubled), vec![0, 0, 1, 1, 2, 2, 3, 3]);
-        assert_eq!(
-            doubled
-                .iter()
-                .map(|frame| frame.duplicate_of)
-                .collect::<Vec<_>>(),
-            vec![None, Some(0), None, Some(2), None, Some(4), None, Some(6)]
+        source_of(&doubled);
+        assert_resampled(&doubled);
+        assert_duplicates(&doubled);
+        assert_output_ticks(&doubled, 20);
+        assert!(
+            doubled.iter().any(|frame| frame.duplicate_of.is_some()),
+            "10 to 20 fps did not repeat a source frame"
         );
 
         let variable = numbered_clip(&dir, "vfr.mov", 30, 15, "setpts=N*N*0.02/TB");
         let varied = extract_rgb_frames_limited(&variable, &dir.join("framesvfr"), 10, 8).unwrap();
-        assert_eq!(source_of(&varied), vec![1, 2, 3, 4, 4, 5, 5, 6]);
+        source_of(&varied);
+        assert_resampled(&varied);
+        assert_duplicates(&varied);
+        assert_output_ticks(&varied, 10);
 
         let shifted = numbered_clip(&dir, "neg.mov", 30, 30, "setpts=PTS-0.5/TB");
         let after_negative =
             extract_rgb_frames_limited(&shifted, &dir.join("framesneg"), 10, 3).unwrap();
         let burned = burned_reds(&shifted);
-        assert_eq!(
-            after_negative
-                .iter()
-                .map(|frame| frame.source_index)
-                .collect::<Vec<_>>(),
-            vec![1, 4, 7]
-        );
+        assert_resampled(&after_negative);
+        assert_duplicates(&after_negative);
+        assert_output_ticks(&after_negative, 10);
         for frame in &after_negative {
             let stored = usize::try_from(frame.source_index).unwrap();
+            let kept = burned.get(stored).copied().unwrap_or_else(|| {
+                panic!(
+                    "sample {} source {} is outside the {} stored frames",
+                    frame.index,
+                    frame.source_index,
+                    burned.len()
+                )
+            });
             assert_eq!(
-                frame.rgb[0], burned[stored],
+                frame.rgb[0], kept,
                 "sample {} kept a different picture than source {}",
                 frame.index, frame.source_index
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn assert_resampled(frames: &[RgbFrame]) {
+        assert!(
+            frames.iter().any(|frame| frame.source_index != frame.index),
+            "fps kept the sample index instead of a source frame"
+        );
+    }
+
+    fn assert_duplicates(frames: &[RgbFrame]) {
+        let sources: Vec<u64> = frames.iter().map(|frame| frame.source_index).collect();
+        let repeats: Vec<Option<u64>> = frames.iter().map(|frame| frame.duplicate_of).collect();
+        assert_eq!(repeats, repeat_of(&sources));
+    }
+
+    fn assert_output_ticks(frames: &[RgbFrame], sample_fps: u32) {
+        assert!(sample_fps > 0);
+        assert!(1_000_000_u32.is_multiple_of(sample_fps));
+        let step = i64::from(1_000_000 / sample_fps);
+        let ticks: Vec<i64> = frames.iter().map(|frame| frame.ticks).collect();
+        let expected: Vec<i64> = (0..frames.len())
+            .map(|index| i64::try_from(index).unwrap() * step)
+            .collect();
+        assert_eq!(ticks, expected);
+        assert!(frames.iter().all(|frame| frame.timescale == 1_000_000));
     }
 
     fn burned_reds(video: &Path) -> Vec<u8> {
