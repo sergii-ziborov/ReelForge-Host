@@ -669,11 +669,12 @@ fn write_frame_manifest(
 }
 
 fn sample_filter(sample_fps: u32) -> String {
-    // One `fps` keeps a frame whose alpha already holds the decoded ordinal.
-    // The picture drops that alpha. The stamp reads it from the same frame.
-    // A second `fps` does not keep the same ordinal, and PTS is not the ordinal.
+    // One `fps` keeps a frame whose extra bottom row holds the decoded ordinal
+    // in a single RGB pixel. The picture crops that row off. FFmpeg 6.1 does
+    // not keep an alpha stamp through `fps`, and a second `fps` can keep a
+    // different frame. PTS is not the ordinal.
     format!(
-        "format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(gte(N,16777215),255,if(eq(X,0)*eq(Y,0),mod(N,256),if(eq(X,1)*eq(Y,0),mod(floor(N/256),256),if(eq(X,2)*eq(Y,0),mod(floor(N/65536),256),255))))',fps={sample_fps},split[pix][id];[pix]format=rgb24,showinfo[pixout];[id]crop=3:1:0:0,geq=r='alpha(X,Y)':g='0':b='0',format=rgb24[idout]"
+        "format=rgb24,pad=iw:ih+1:0:0:black,geq=r='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(N,256)),r(X,Y))':g='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/256),256)),g(X,Y))':b='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/65536),256)),b(X,Y))',fps={sample_fps},split[pix][id];[pix]crop=iw:ih-1:0:0,format=rgb24,showinfo[pixout];[id]crop=1:1:0:ih-1,format=rgb24[idout]"
     )
 }
 
@@ -838,8 +839,8 @@ fn showinfo_frame(line: &str) -> Option<ShowFrame> {
 }
 
 fn read_source_stamps(path: &Path, written: usize) -> Result<Vec<u64>> {
-    // Three rgb24 pixels. The ordinal lives in R at bytes 0, 3, and 6.
-    const STAMP_STRIDE: usize = 9;
+    // One rgb24 pixel. R, G, and B are the low, mid, and high bytes.
+    const STAMP_STRIDE: usize = 3;
     let bytes = std::fs::read(path)
         .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))?;
     if !bytes.len().is_multiple_of(STAMP_STRIDE) {
@@ -855,7 +856,7 @@ fn read_source_stamps(path: &Path, written: usize) -> Result<Vec<u64>> {
     }
     let mut indexes = Vec::with_capacity(written);
     for pixel in bytes.chunks(STAMP_STRIDE).take(written) {
-        indexes.push(stamp_index([pixel[0], pixel[3], pixel[6]])?);
+        indexes.push(stamp_index([pixel[0], pixel[1], pixel[2]])?);
     }
     Ok(indexes)
 }
@@ -1413,23 +1414,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stamp_dir);
         std::fs::create_dir_all(&stamp_dir).unwrap();
         let stamp_path = stamp_dir.join("source-index.rgb");
-        let mut packed = vec![0_u8; 27];
-        packed[0] = 1;
-        packed[12] = 1;
-        packed[18] = 2;
-        packed[24] = 1;
+        let packed = vec![1_u8, 0, 0, 0, 1, 0, 2, 0, 1];
         std::fs::write(&stamp_path, &packed).unwrap();
         assert_eq!(
             read_source_stamps(&stamp_path, 3).unwrap(),
             vec![1, 256, 65_538]
         );
-        std::fs::write(&stamp_path, &packed[..18]).unwrap();
+        std::fs::write(&stamp_path, &packed[..6]).unwrap();
         let Err(err) = read_source_stamps(&stamp_path, 3) else {
             panic!("a short source stamp was accepted");
         };
         assert!(err.to_string().contains("logged 2"), "{err}");
         assert!(err.to_string().contains("wrote 3"), "{err}");
-        std::fs::write(&stamp_path, &packed[..10]).unwrap();
+        std::fs::write(&stamp_path, &packed[..4]).unwrap();
         let Err(err) = read_source_stamps(&stamp_path, 1) else {
             panic!("a partial source stamp was accepted");
         };
