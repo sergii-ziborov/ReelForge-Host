@@ -999,8 +999,6 @@ fn sample_decoded_pictures(
         ])
         .arg(video)
         .args([
-            "-vf",
-            "format=rgb24",
             "-an",
             "-fps_mode",
             "passthrough",
@@ -1912,7 +1910,7 @@ mod tests {
         let thirty = numbered_clip(&dir, "thirty.mov", 30, 15, "");
         let frames_dir = dir.join("frames30");
         let frames = extract_rgb_frames_limited(&thirty, &frames_dir, 10, 5).unwrap();
-        let sources = source_of(&frames);
+        let sources = source_of(&frames, &thirty);
         assert_resampled(&frames);
         assert_duplicates(&frames);
         assert_output_ticks(&frames, 10);
@@ -1933,14 +1931,14 @@ mod tests {
         let twenty_four = numbered_clip(&dir, "twentyfour.mov", 24, 12, "");
         let from_twenty_four =
             extract_rgb_frames_limited(&twenty_four, &dir.join("frames24"), 10, 5).unwrap();
-        source_of(&from_twenty_four);
+        source_of(&from_twenty_four, &twenty_four);
         assert_resampled(&from_twenty_four);
         assert_duplicates(&from_twenty_four);
         assert_output_ticks(&from_twenty_four, 10);
 
         let upsampled = numbered_clip(&dir, "ten.mov", 10, 5, "");
         let doubled = extract_rgb_frames_limited(&upsampled, &dir.join("frames20"), 20, 8).unwrap();
-        source_of(&doubled);
+        source_of(&doubled, &upsampled);
         assert_resampled(&doubled);
         assert_duplicates(&doubled);
         assert_output_ticks(&doubled, 20);
@@ -1951,7 +1949,7 @@ mod tests {
 
         let variable = numbered_clip(&dir, "vfr.mov", 30, 15, "setpts=N*N*0.02/TB");
         let varied = extract_rgb_frames_limited(&variable, &dir.join("framesvfr"), 10, 8).unwrap();
-        source_of(&varied);
+        source_of(&varied, &variable);
         assert_resampled(&varied);
         assert_duplicates(&varied);
         assert_output_ticks(&varied, 10);
@@ -1959,26 +1957,10 @@ mod tests {
         let shifted = numbered_clip(&dir, "neg.mov", 30, 30, "setpts=PTS-0.5/TB");
         let after_negative =
             extract_rgb_frames_limited(&shifted, &dir.join("framesneg"), 10, 3).unwrap();
-        let burned = burned_reds(&shifted);
+        source_of(&after_negative, &shifted);
         assert_resampled(&after_negative);
         assert_duplicates(&after_negative);
         assert_output_ticks(&after_negative, 10);
-        for frame in &after_negative {
-            let stored = usize::try_from(frame.source_index).unwrap();
-            let kept = burned.get(stored).copied().unwrap_or_else(|| {
-                panic!(
-                    "sample {} source {} is outside the {} stored frames",
-                    frame.index,
-                    frame.source_index,
-                    burned.len()
-                )
-            });
-            assert_eq!(
-                frame.rgb[0], kept,
-                "sample {} kept a different picture than source {}",
-                frame.index, frame.source_index
-            );
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2010,9 +1992,26 @@ mod tests {
     fn burned_reds(video: &Path) -> Vec<u8> {
         let raw = video.with_extension("raw");
         let status = Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-threads",
+                "1",
+                "-filter_threads",
+                "1",
+                "-i",
+            ])
             .arg(video)
-            .args(["-f", "rawvideo", "-pix_fmt", "rgb24"])
+            .args([
+                "-an",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+            ])
             .arg(&raw)
             .status()
             .unwrap();
@@ -2021,17 +2020,24 @@ mod tests {
         bytes.chunks(16 * 16 * 3).map(|chunk| chunk[0]).collect()
     }
 
-    fn source_of(frames: &[RgbFrame]) -> Vec<u64> {
+    fn source_of(frames: &[RgbFrame], video: &Path) -> Vec<u64> {
+        let burned = burned_reds(video);
         frames
             .iter()
             .map(|frame| {
+                let stored = usize::try_from(frame.source_index).unwrap();
+                let kept = burned.get(stored).copied().unwrap_or_else(|| {
+                    panic!(
+                        "sample {} source {} is outside the {} stored frames",
+                        frame.index,
+                        frame.source_index,
+                        burned.len()
+                    )
+                });
                 assert_eq!(
-                    u64::from(frame.rgb[0]),
-                    frame.source_index,
-                    "sample {} pixel {} source {}",
-                    frame.index,
-                    frame.rgb[0],
-                    frame.source_index
+                    frame.rgb[0], kept,
+                    "sample {} pixel {} source {} stored {kept}",
+                    frame.index, frame.rgb[0], frame.source_index
                 );
                 frame.source_index
             })
