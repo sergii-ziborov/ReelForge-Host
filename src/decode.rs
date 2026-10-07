@@ -572,7 +572,6 @@ pub fn extract_sampled_pictures_cancellable(
         ));
     }
     let indexes = lift_source_stamps(&pictures)?;
-    crop_stamp_rows(out_dir, pictures.len(), cancel)?;
     let sampled = sampled_showinfo(&stderr)?;
     let sampled = written_showinfo(&sampled, pictures.len())?;
     let sampled_pts: Vec<f64> = sampled.iter().map(|frame| frame.pts_time).collect();
@@ -668,8 +667,8 @@ fn write_frame_manifest(
 
 fn sample_filter(sample_fps: u32) -> String {
     // One output. The extra bottom row holds the decoded ordinal in one RGB
-    // pixel, and `fps` keeps that whole frame. A second output can receive a
-    // different frame on FFmpeg 6.1. The row is removed after the stamp is read.
+    // pixel, and `fps` keeps that whole frame. The row is removed in process
+    // after the stamp is read. A second ffmpeg pass can resample that row away.
     format!(
         "format=rgb24,pad=iw:ih+1:0:0:black,geq=r='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(N,256)),r(X,Y))':g='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/256),256)),g(X,Y))':b='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/65536),256)),b(X,Y))',fps={sample_fps},format=rgb24,showinfo"
     )
@@ -834,6 +833,7 @@ fn lift_source_stamps(pictures: &[SampledPicture]) -> Result<Vec<u64>> {
             decoded.width,
             decoded.height,
         )?);
+        write_picture_without_stamp(&picture.path, &decoded)?;
     }
     Ok(indexes)
 }
@@ -873,59 +873,46 @@ fn stamp_from_picture(rgb: &[u8], width: u32, height: u32) -> Result<u64> {
     stamp_index([rgb[at], rgb[at + 1], rgb[at + 2]])
 }
 
-fn crop_stamp_rows(out_dir: &Path, count: usize, cancel: Option<&ExtractCancel>) -> Result<()> {
-    if cancel.is_some_and(ExtractCancel::is_cancelled) {
-        return Err(HostError::Ffmpeg("extract cancelled".into()));
+fn write_picture_without_stamp(path: &Path, decoded: &sightloom_host::DecodedRgb) -> Result<()> {
+    let Ok(wide) = usize::try_from(decoded.width) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    };
+    let Ok(high) = usize::try_from(decoded.height) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    };
+    if high < 2 {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
     }
-    if count == 0 {
-        return Ok(());
+    let Some(stride) = wide.checked_mul(3) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    };
+    let Some(keep) = stride.checked_mul(high - 1) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    };
+    if decoded.rgb.len() < keep {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
     }
-    let cropped = out_dir.join("cropped-pictures");
-    let _ = std::fs::remove_dir_all(&cropped);
-    std::fs::create_dir_all(&cropped)?;
-    let limit = count.to_string();
-    let source = out_dir.join("frame_%06d.png");
-    let dest = cropped.join("frame_%06d.png");
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-start_number",
-            "0",
-            "-i",
-        ])
-        .arg(&source)
-        .args([
-            "-frames:v",
-            &limit,
-            "-vf",
-            "crop=iw:ih-1:0:0",
-            "-start_number",
-            "0",
-        ])
-        .arg(&dest)
-        .stderr(Stdio::null())
-        .stdout(Stdio::null())
-        .spawn()
-        .map_err(|err| HostError::Ffmpeg(format!("ffmpeg crop spawn: {err}")))?;
-    let status = wait_ffmpeg(&mut child, cancel)?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(&cropped);
-        return Err(HostError::Ffmpeg(format!(
-            "extract refuses a source frame that does not match the pictures ({status})"
-        )));
-    }
-    for index in 0..count {
-        let name = format!("frame_{index:06}.png");
-        let from = cropped.join(&name);
-        let to = out_dir.join(&name);
-        std::fs::remove_file(&to)?;
-        std::fs::rename(&from, &to)?;
-    }
-    let _ = std::fs::remove_dir_all(&cropped);
-    Ok(())
+    image::save_buffer_with_format(
+        path,
+        &decoded.rgb[..keep],
+        decoded.width,
+        decoded.height - 1,
+        image::ExtendedColorType::Rgb8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))
 }
 
 fn stamp_index(rgb: [u8; 3]) -> Result<u64> {
