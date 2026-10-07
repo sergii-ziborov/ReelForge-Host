@@ -535,10 +535,9 @@ pub fn extract_sampled_pictures_cancellable(
     std::fs::create_dir_all(out_dir)?;
     clear_frame_pngs(out_dir)?;
     let pattern = out_dir.join("frame_%06d.png");
-    let identity = out_dir.join("source-index.rgb");
-    let _ = std::fs::remove_file(&identity);
+    let _ = std::fs::remove_file(out_dir.join("source-index.rgb"));
     let limit = max_frames.to_string();
-    let stderr = run_ffmpeg_extract(video, &pattern, &identity, sample_fps, &limit, cancel)?;
+    let stderr = run_ffmpeg_extract(video, &pattern, sample_fps, &limit, cancel)?;
 
     let mut pictures = Vec::new();
     let mut index = 0_u64;
@@ -572,9 +571,8 @@ pub fn extract_sampled_pictures_cancellable(
             "ffmpeg wrote no frames (empty or unreadable video)".into(),
         ));
     }
-    let indexes = read_source_stamps(&identity, pictures.len());
-    let _ = std::fs::remove_file(&identity);
-    let indexes = indexes?;
+    let indexes = lift_source_stamps(&pictures)?;
+    crop_stamp_rows(out_dir, pictures.len(), cancel)?;
     let sampled = sampled_showinfo(&stderr)?;
     let sampled = written_showinfo(&sampled, pictures.len())?;
     let sampled_pts: Vec<f64> = sampled.iter().map(|frame| frame.pts_time).collect();
@@ -669,19 +667,17 @@ fn write_frame_manifest(
 }
 
 fn sample_filter(sample_fps: u32) -> String {
-    // One `fps` keeps a frame whose extra bottom row holds the decoded ordinal
-    // in a single RGB pixel. The picture crops that row off. FFmpeg 6.1 does
-    // not keep an alpha stamp through `fps`, and a second `fps` can keep a
-    // different frame. PTS is not the ordinal.
+    // One output. The extra bottom row holds the decoded ordinal in one RGB
+    // pixel, and `fps` keeps that whole frame. A second output can receive a
+    // different frame on FFmpeg 6.1. The row is removed after the stamp is read.
     format!(
-        "format=rgb24,pad=iw:ih+1:0:0:black,geq=r='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(N,256)),r(X,Y))':g='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/256),256)),g(X,Y))':b='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/65536),256)),b(X,Y))',fps={sample_fps},split[pix][id];[pix]crop=iw:ih-1:0:0,format=rgb24,showinfo[pixout];[id]crop=1:1:0:ih-1,format=rgb24[idout]"
+        "format=rgb24,pad=iw:ih+1:0:0:black,geq=r='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(N,256)),r(X,Y))':g='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/256),256)),g(X,Y))':b='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/65536),256)),b(X,Y))',fps={sample_fps},format=rgb24,showinfo"
     )
 }
 
 fn run_ffmpeg_extract(
     video: &Path,
     pattern: &Path,
-    identity: &Path,
     sample_fps: u32,
     limit: &str,
     cancel: Option<&ExtractCancel>,
@@ -696,10 +692,9 @@ fn run_ffmpeg_extract(
     let mut child = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "info", "-y", "-i"])
         .arg(video)
-        .args(["-filter_complex", &graph])
         .args([
-            "-map",
-            "[pixout]",
+            "-vf",
+            &graph,
             "-pix_fmt",
             "rgb24",
             "-start_number",
@@ -708,17 +703,6 @@ fn run_ffmpeg_extract(
             limit,
         ])
         .arg(pattern)
-        .args([
-            "-map",
-            "[idout]",
-            "-frames:v",
-            limit,
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-        ])
-        .arg(identity)
         .stderr(Stdio::from(log_file))
         .stdout(Stdio::null())
         .spawn()
@@ -838,27 +822,110 @@ fn showinfo_frame(line: &str) -> Option<ShowFrame> {
     Some(ShowFrame { pts_time })
 }
 
-fn read_source_stamps(path: &Path, written: usize) -> Result<Vec<u64>> {
-    // One rgb24 pixel. R, G, and B are the low, mid, and high bytes.
-    const STAMP_STRIDE: usize = 3;
-    let bytes = std::fs::read(path)
-        .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))?;
-    if !bytes.len().is_multiple_of(STAMP_STRIDE) {
+fn lift_source_stamps(pictures: &[SampledPicture]) -> Result<Vec<u64>> {
+    let mut indexes = Vec::with_capacity(pictures.len());
+    for picture in pictures {
+        let bytes = std::fs::read(&picture.path)
+            .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))?;
+        let decoded = sightloom_host::decode_encoded_rgb(&bytes)
+            .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))?;
+        indexes.push(stamp_from_picture(
+            &decoded.rgb,
+            decoded.width,
+            decoded.height,
+        )?);
+    }
+    Ok(indexes)
+}
+
+fn stamp_from_picture(rgb: &[u8], width: u32, height: u32) -> Result<u64> {
+    if height < 2 || width == 0 {
         return Err(HostError::Ffmpeg(
             "extract refuses a source frame that does not match the pictures".into(),
         ));
     }
-    let frames = bytes.len() / STAMP_STRIDE;
-    if frames < written {
+    let Ok(wide) = usize::try_from(width) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    };
+    let Ok(high) = usize::try_from(height) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    };
+    let Some(stride) = wide.checked_mul(3) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    };
+    let Some(needed) = stride.checked_mul(high) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    };
+    if rgb.len() < needed {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    }
+    let at = stride * (high - 1);
+    stamp_index([rgb[at], rgb[at + 1], rgb[at + 2]])
+}
+
+fn crop_stamp_rows(out_dir: &Path, count: usize, cancel: Option<&ExtractCancel>) -> Result<()> {
+    if cancel.is_some_and(ExtractCancel::is_cancelled) {
+        return Err(HostError::Ffmpeg("extract cancelled".into()));
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    let cropped = out_dir.join("cropped-pictures");
+    let _ = std::fs::remove_dir_all(&cropped);
+    std::fs::create_dir_all(&cropped)?;
+    let limit = count.to_string();
+    let source = out_dir.join("frame_%06d.png");
+    let dest = cropped.join("frame_%06d.png");
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-start_number",
+            "0",
+            "-i",
+        ])
+        .arg(&source)
+        .args([
+            "-frames:v",
+            &limit,
+            "-vf",
+            "crop=iw:ih-1:0:0",
+            "-start_number",
+            "0",
+        ])
+        .arg(&dest)
+        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|err| HostError::Ffmpeg(format!("ffmpeg crop spawn: {err}")))?;
+    let status = wait_ffmpeg(&mut child, cancel)?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&cropped);
         return Err(HostError::Ffmpeg(format!(
-            "extract refuses a source frame that does not match the pictures: logged {frames}, wrote {written}"
+            "extract refuses a source frame that does not match the pictures ({status})"
         )));
     }
-    let mut indexes = Vec::with_capacity(written);
-    for pixel in bytes.chunks(STAMP_STRIDE).take(written) {
-        indexes.push(stamp_index([pixel[0], pixel[1], pixel[2]])?);
+    for index in 0..count {
+        let name = format!("frame_{index:06}.png");
+        let from = cropped.join(&name);
+        let to = out_dir.join(&name);
+        std::fs::remove_file(&to)?;
+        std::fs::rename(&from, &to)?;
     }
-    Ok(indexes)
+    let _ = std::fs::remove_dir_all(&cropped);
+    Ok(())
 }
 
 fn stamp_index(rgb: [u8; 3]) -> Result<u64> {
@@ -1410,28 +1477,20 @@ mod tests {
         assert!(err.to_string().contains("does not fit"), "{err}");
         assert_eq!(repeat_of(&[1, 4, 7]), vec![None, None, None]);
         assert_eq!(repeat_of(&[0, 0, 1, 1]), vec![None, Some(0), None, Some(2)]);
-        let stamp_dir = std::env::temp_dir().join(format!("rf-host-stamp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&stamp_dir);
-        std::fs::create_dir_all(&stamp_dir).unwrap();
-        let stamp_path = stamp_dir.join("source-index.rgb");
-        let packed = vec![1_u8, 0, 0, 0, 1, 0, 2, 0, 1];
-        std::fs::write(&stamp_path, &packed).unwrap();
-        assert_eq!(
-            read_source_stamps(&stamp_path, 3).unwrap(),
-            vec![1, 256, 65_538]
-        );
-        std::fs::write(&stamp_path, &packed[..6]).unwrap();
-        let Err(err) = read_source_stamps(&stamp_path, 3) else {
-            panic!("a short source stamp was accepted");
-        };
-        assert!(err.to_string().contains("logged 2"), "{err}");
-        assert!(err.to_string().contains("wrote 3"), "{err}");
-        std::fs::write(&stamp_path, &packed[..4]).unwrap();
-        let Err(err) = read_source_stamps(&stamp_path, 1) else {
-            panic!("a partial source stamp was accepted");
+        let mut rgb = vec![9_u8; 3 * 3 * 2];
+        let stamp_at = 3 * 3;
+        rgb[stamp_at] = 2;
+        rgb[stamp_at + 1] = 0;
+        rgb[stamp_at + 2] = 1;
+        assert_eq!(stamp_from_picture(&rgb, 3, 2).unwrap(), 65_538);
+        let Err(err) = stamp_from_picture(&rgb, 3, 1) else {
+            panic!("a picture with no stamp row was accepted");
         };
         assert!(err.to_string().contains("does not match"), "{err}");
-        let _ = std::fs::remove_dir_all(&stamp_dir);
+        let Err(err) = stamp_from_picture(&rgb[..3], 3, 2) else {
+            panic!("a short picture was accepted");
+        };
+        assert!(err.to_string().contains("does not match"), "{err}");
         let one = "\
 [Parsed_showinfo_1 @ 1] n:   0 pts: 0 pts_time:0
 [Parsed_showinfo_1 @ 1] n:   1 pts: 1 pts_time:0.1
