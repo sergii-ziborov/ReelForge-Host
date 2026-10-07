@@ -666,11 +666,13 @@ fn write_frame_manifest(
 }
 
 fn sample_filter(sample_fps: u32) -> String {
-    // One output. The extra bottom row holds the decoded ordinal in one RGB
-    // pixel, and `fps` keeps that whole frame. The row is removed in process
-    // after the stamp is read. A second ffmpeg pass can resample that row away.
+    // One output. The extra bottom row stores the decoded ordinal in one RGB
+    // pixel. `geq` writes planar GBR, and FFmpeg 6.1.1 `fps` only references
+    // that frame, so the next stamp can change the row while the picture stays.
+    // Packed `format=rgb24` copies the picture and the stamp together first.
+    // Nearest sampling keeps the ordinal exact. The row is removed in process.
     format!(
-        "format=rgb24,pad=iw:ih+1:0:0:black,geq=r='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(N,256)),r(X,Y))':g='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/256),256)),g(X,Y))':b='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/65536),256)),b(X,Y))',fps={sample_fps},format=rgb24,showinfo"
+        "format=rgb24,pad=iw:ih+1:0:0:black,geq=r='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(N,256)),r(X,Y))':g='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/256),256)),g(X,Y))':b='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/65536),256)),b(X,Y))':interpolation=nearest,format=rgb24,fps={sample_fps},format=rgb24,showinfo"
     )
 }
 
@@ -689,11 +691,25 @@ fn run_ffmpeg_extract(
         .map_err(|err| HostError::Ffmpeg(format!("extract log: {err}")))?;
     let graph = sample_filter(sample_fps);
     let mut child = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "info", "-y", "-i"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-sws_flags",
+            "neighbor",
+            "-y",
+            "-i",
+        ])
         .arg(video)
         .args([
             "-vf",
             &graph,
+            "-fps_mode",
+            "passthrough",
             "-pix_fmt",
             "rgb24",
             "-start_number",
