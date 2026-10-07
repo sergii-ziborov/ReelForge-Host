@@ -164,6 +164,105 @@ fn project_command_explains_audio_speed_and_refuses_picture_ops() {
 }
 
 #[test]
+fn project_command_keeps_audio_role_and_refuses_it_on_video() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = dir.path().join("kept.json");
+    std::fs::write(
+        &kept,
+        r#"{
+  "version": 1,
+  "id": "p",
+  "name": "av",
+  "media": [
+    { "id": "a", "uri": "a.mp4" },
+    { "id": "m", "uri": "m.wav", "role": "audio" }
+  ],
+  "sequences": [{
+    "id": "s",
+    "name": "main",
+    "tracks": [
+      {
+        "id": "v0",
+        "kind": "video",
+        "items": [{
+          "kind": "clip",
+          "id": "pic",
+          "media": "a",
+          "source": {
+            "start": { "ticks": 0, "timescale": 1000 },
+            "duration": { "ticks": 2000, "timescale": 1000 }
+          }
+        }]
+      },
+      {
+        "id": "a0",
+        "kind": "audio",
+        "items": [{
+          "kind": "clip",
+          "id": "snd",
+          "media": "m",
+          "source": {
+            "start": { "ticks": 0, "timescale": 1000 },
+            "duration": { "ticks": 2000, "timescale": 1000 }
+          }
+        }]
+      }
+    ]
+  }]
+}"#,
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["project", "--graph", kept.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}\n{stdout}");
+    assert!(stdout.contains("\"role\": \"audio\""), "{stdout}");
+    assert!(stdout.contains("\"rf.audio.mix\""), "{stdout}");
+
+    let refused = dir.path().join("video-wav.json");
+    std::fs::write(
+        &refused,
+        r#"{
+  "version": 1,
+  "id": "p",
+  "name": "av",
+  "media": [{ "id": "m", "uri": "m.wav", "role": "audio" }],
+  "sequences": [{
+    "id": "s",
+    "name": "main",
+    "tracks": [{
+      "id": "v0",
+      "kind": "video",
+      "items": [{
+        "kind": "clip",
+        "id": "pic",
+        "media": "m",
+        "source": {
+          "start": { "ticks": 0, "timescale": 1000 },
+          "duration": { "ticks": 2000, "timescale": 1000 }
+        }
+      }]
+    }]
+  }]
+}"#,
+    )
+    .unwrap();
+    let bad = Command::new(bin())
+        .args(["project", refused.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(!bad.status.success(), "{err}");
+    assert!(
+        err.contains("clip pic: audio media cannot compile on a video track"),
+        "{err}"
+    );
+}
+
+#[test]
 fn unknown_style_fails_before_weights() {
     let out = Command::new(bin())
         .args([
