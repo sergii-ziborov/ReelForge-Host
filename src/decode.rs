@@ -13,11 +13,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct SampledPicture {
     /// Zero-based index in the extracted sample sequence.
     pub index: u64,
-    /// Zero-based frame number in the source, before `fps` sampling.
+    /// Decoded ordinal of the source frame whose picture this sample shows.
     pub source_index: u64,
+    /// Earlier sample that already showed this source frame.
+    ///
+    /// `None` when this is the first sample of that frame.
+    pub duplicate_of: Option<u64>,
     /// Presentation ticks at [`Self::timescale`].
     pub ticks: i64,
-    /// Ticks per second. `1_000_000` for a source presentation time.
+    /// Ticks per second. `1_000_000` for a sampled presentation time.
     pub timescale: u32,
     path: PathBuf,
 }
@@ -36,6 +40,7 @@ impl SampledPicture {
         Ok(RgbFrame {
             index: self.index,
             source_index: self.source_index,
+            duplicate_of: self.duplicate_of,
             ticks: self.ticks,
             timescale: self.timescale,
             width: decoded.width,
@@ -53,15 +58,20 @@ pub const RGB_BATCH_FRAMES: usize = 8;
 pub struct RgbFrame {
     /// Zero-based index in the extracted sample sequence.
     pub index: u64,
-    /// Zero-based frame number in the source, before `fps` sampling.
+    /// Decoded ordinal of the source frame whose picture this sample shows.
     ///
-    /// This is not [`Self::index`] and not [`Self::ticks`].
+    /// This is not [`Self::index`] and not [`Self::ticks`]. A repeated picture
+    /// uses the same ordinal again.
     pub source_index: u64,
+    /// Earlier sample that already showed this source frame.
+    ///
+    /// `None` when this is the first sample of that frame.
+    pub duplicate_of: Option<u64>,
     /// Presentation ticks at [`Self::timescale`].
     ///
-    /// Source time from ffmpeg `showinfo` after sampling, in microseconds.
+    /// Sampled presentation time from `showinfo` after `fps`, in microseconds.
     pub ticks: i64,
-    /// Ticks per second. `1_000_000` for a source presentation time.
+    /// Ticks per second. `1_000_000` for a sampled presentation time.
     pub timescale: u32,
     /// Width.
     pub width: u32,
@@ -76,9 +86,13 @@ pub struct RgbFrame {
 pub struct ProxySample {
     /// Index in the extracted sequence.
     pub index: u64,
-    /// Frame number in the source, before sampling.
+    /// Decoded ordinal of the source frame whose picture this sample shows.
     pub source_index: u64,
-    /// Source presentation ticks.
+    /// Earlier sample that already showed this source frame.
+    ///
+    /// `None` when this is the first sample of that frame.
+    pub duplicate_of: Option<u64>,
+    /// Sampled presentation ticks.
     pub pts_ticks: i64,
     /// Ticks per second for [`Self::pts_ticks`].
     pub timescale: u32,
@@ -158,6 +172,7 @@ impl ProxyMap {
             (
                 frame.index,
                 frame.source_index,
+                frame.duplicate_of,
                 frame.ticks,
                 frame.timescale,
             )
@@ -171,21 +186,25 @@ impl ProxyMap {
             (
                 picture.index,
                 picture.source_index,
+                picture.duplicate_of,
                 picture.ticks,
                 picture.timescale,
             )
         }))
     }
 
-    fn from_timed(timed: impl Iterator<Item = (u64, u64, i64, u32)>) -> Self {
+    fn from_timed(timed: impl Iterator<Item = (u64, u64, Option<u64>, i64, u32)>) -> Self {
         Self {
             samples: timed
-                .map(|(index, source_index, pts_ticks, timescale)| ProxySample {
-                    index,
-                    source_index,
-                    pts_ticks,
-                    timescale,
-                })
+                .map(
+                    |(index, source_index, duplicate_of, pts_ticks, timescale)| ProxySample {
+                        index,
+                        source_index,
+                        duplicate_of,
+                        pts_ticks,
+                        timescale,
+                    },
+                )
                 .collect(),
         }
     }
@@ -478,7 +497,7 @@ pub fn extract_rgb_frames_cancellable(
 ///
 /// # Errors
 ///
-/// A zero cap, ffmpeg failure, or a showinfo log that cannot be paired.
+/// A zero cap, ffmpeg failure, or a source stamp that does not match the pictures.
 pub fn extract_sampled_pictures(
     video: &Path,
     out_dir: &Path,
@@ -492,7 +511,7 @@ pub fn extract_sampled_pictures(
 ///
 /// # Errors
 ///
-/// Cancellation, a zero cap, ffmpeg failure, or a showinfo log that cannot be paired.
+/// Cancellation, a zero cap, ffmpeg failure, or a source stamp that does not match the pictures.
 pub fn extract_sampled_pictures_cancellable(
     video: &Path,
     out_dir: &Path,
@@ -516,10 +535,10 @@ pub fn extract_sampled_pictures_cancellable(
     std::fs::create_dir_all(out_dir)?;
     clear_frame_pngs(out_dir)?;
     let pattern = out_dir.join("frame_%06d.png");
-    let fps = format!("showinfo,fps={sample_fps},showinfo");
+    let identity = out_dir.join("source-index.rgb");
+    let _ = std::fs::remove_file(&identity);
     let limit = max_frames.to_string();
-    let stderr = run_ffmpeg_extract(video, &pattern, &fps, &limit, cancel)?;
-    let (before_fps, after_fps) = show_streams(&stderr)?;
+    let stderr = run_ffmpeg_extract(video, &pattern, &identity, sample_fps, &limit, cancel)?;
 
     let mut pictures = Vec::new();
     let mut index = 0_u64;
@@ -532,6 +551,7 @@ pub fn extract_sampled_pictures_cancellable(
         pictures.push(SampledPicture {
             index,
             source_index: index,
+            duplicate_of: None,
             ticks: i64::try_from(index).unwrap_or(0),
             timescale: sample_fps,
             path,
@@ -552,11 +572,17 @@ pub fn extract_sampled_pictures_cancellable(
             "ffmpeg wrote no frames (empty or unreadable video)".into(),
         ));
     }
-    let after_fps = written_showinfo(&after_fps, pictures.len())?;
-    let sampled_pts: Vec<f64> = after_fps.iter().map(|frame| frame.pts_time).collect();
+    let indexes = read_source_stamps(&identity, pictures.len());
+    let _ = std::fs::remove_file(&identity);
+    let indexes = indexes?;
+    let sampled = sampled_showinfo(&stderr)?;
+    let sampled = written_showinfo(&sampled, pictures.len())?;
+    let sampled_pts: Vec<f64> = sampled.iter().map(|frame| frame.pts_time).collect();
     apply_source_pts(&mut pictures, &sampled_pts)?;
-    let indexes = source_indexes(&before_fps, &after_fps)?;
     apply_source_index(&mut pictures, &indexes)?;
+    for (picture, repeat) in pictures.iter_mut().zip(repeat_of(&indexes)) {
+        picture.duplicate_of = repeat;
+    }
     write_frame_manifest(out_dir, max_frames, hit_cap, sample_fps, &pictures)?;
     Ok(pictures)
 }
@@ -629,9 +655,11 @@ fn write_frame_manifest(
         "timescale": pictures[0].timescale,
         "pts_ticks": pictures.iter().map(|picture| picture.ticks).collect::<Vec<_>>(),
         "source_index": pictures.iter().map(|picture| picture.source_index).collect::<Vec<_>>(),
+        "duplicate_of": pictures.iter().map(|picture| picture.duplicate_of).collect::<Vec<_>>(),
         "proxy": proxy.samples.iter().map(|sample| serde_json::json!({
             "index": sample.index,
             "source_index": sample.source_index,
+            "duplicate_of": sample.duplicate_of,
             "pts_ticks": sample.pts_ticks,
             "timescale": sample.timescale,
         })).collect::<Vec<_>>(),
@@ -640,10 +668,20 @@ fn write_frame_manifest(
         .map_err(|err| HostError::Ffmpeg(format!("frame manifest: {err}")))
 }
 
+fn sample_filter(sample_fps: u32) -> String {
+    // The identity branch stamps the decoded ordinal, then runs the same `fps`
+    // filter. The picture branch does not carry that stamp. PTS equality is not
+    // used: `fps` rewrites presentation time and can repeat a frame.
+    format!(
+        "split[pixsrc][idsrc];[idsrc]scale=1:1:flags=neighbor,format=rgb24,geq=r='if(gte(N,16777215),255,mod(N,256))':g='if(gte(N,16777215),255,mod(floor(N/256),256))':b='if(gte(N,16777215),255,mod(floor(N/65536),256))',fps={sample_fps}[idout];[pixsrc]fps={sample_fps},showinfo,format=rgb24[pixout]"
+    )
+}
+
 fn run_ffmpeg_extract(
     video: &Path,
     pattern: &Path,
-    fps: &str,
+    identity: &Path,
+    sample_fps: u32,
     limit: &str,
     cancel: Option<&ExtractCancel>,
 ) -> Result<String> {
@@ -653,11 +691,33 @@ fn run_ffmpeg_extract(
     let log_path = pattern.with_file_name(".extract-stderr.txt");
     let log_file = std::fs::File::create(&log_path)
         .map_err(|err| HostError::Ffmpeg(format!("extract log: {err}")))?;
+    let graph = sample_filter(sample_fps);
     let mut child = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "info", "-y", "-i"])
         .arg(video)
-        .args(["-vf", fps, "-start_number", "0", "-frames:v", limit])
+        .args(["-filter_complex", &graph])
+        .args([
+            "-map",
+            "[pixout]",
+            "-pix_fmt",
+            "rgb24",
+            "-start_number",
+            "0",
+            "-frames:v",
+            limit,
+        ])
         .arg(pattern)
+        .args([
+            "-map",
+            "[idout]",
+            "-frames:v",
+            limit,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+        ])
+        .arg(identity)
         .stderr(Stdio::from(log_file))
         .stdout(Stdio::null())
         .spawn()
@@ -701,7 +761,6 @@ fn wait_ffmpeg(
 
 #[derive(Clone, Copy)]
 struct ShowFrame {
-    n: u64,
     pts_time: f64,
 }
 
@@ -717,25 +776,20 @@ fn written_showinfo(notes: &[ShowFrame], written: usize) -> Result<Vec<ShowFrame
     Ok(notes.iter().take(written).copied().collect())
 }
 
-fn show_streams(stderr: &str) -> Result<(Vec<ShowFrame>, Vec<ShowFrame>)> {
+fn sampled_showinfo(stderr: &str) -> Result<Vec<ShowFrame>> {
     let groups = showinfo_groups(stderr);
     let mut groups = groups.into_iter();
-    let Some(before_fps) = groups.next() else {
+    let Some(sampled) = groups.next() else {
         return Err(HostError::Ffmpeg(
             "extract refuses a frame log with no source index".into(),
         ));
     };
-    let Some(after_fps) = groups.next() else {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a frame log with no source index".into(),
-        ));
-    };
-    if groups.next().is_some() || before_fps.is_empty() || after_fps.is_empty() {
+    if groups.next().is_some() || sampled.is_empty() {
         return Err(HostError::Ffmpeg(
             "extract refuses a frame log with no source index".into(),
         ));
     }
-    Ok((before_fps, after_fps))
+    Ok(sampled)
 }
 
 fn showinfo_groups(stderr: &str) -> Vec<Vec<ShowFrame>> {
@@ -771,7 +825,7 @@ fn showinfo_instance(line: &str) -> Option<u32> {
 fn showinfo_frame(line: &str) -> Option<ShowFrame> {
     let n_at = line.find("n:")?;
     let n_token = line[n_at + 2..].split_whitespace().next()?;
-    let n = n_token.parse().ok()?;
+    n_token.parse::<u64>().ok()?;
     let time_at = line.find("pts_time:")?;
     let time_token = line[time_at + "pts_time:".len()..]
         .split_whitespace()
@@ -780,44 +834,56 @@ fn showinfo_frame(line: &str) -> Option<ShowFrame> {
     if !pts_time.is_finite() || pts_time < 0.0 {
         return None;
     }
-    Some(ShowFrame { n, pts_time })
+    Some(ShowFrame { pts_time })
 }
 
-fn source_indexes(before_fps: &[ShowFrame], after_fps: &[ShowFrame]) -> Result<Vec<u64>> {
-    let mut indexes = Vec::with_capacity(after_fps.len());
-    let mut cursor = 0_usize;
-    for sample in after_fps {
-        let Some(want) = pts_ticks(sample.pts_time) else {
-            return Err(HostError::Ffmpeg(
-                "extract refuses a sample with no source frame".into(),
-            ));
-        };
-        let mut matched = None;
-        while cursor < before_fps.len() {
-            let Some(have) = pts_ticks(before_fps[cursor].pts_time) else {
-                return Err(HostError::Ffmpeg(
-                    "extract refuses a sample with no source frame".into(),
-                ));
-            };
-            let delta = i128::from(have) - i128::from(want);
-            if delta.abs() <= 2 {
-                matched = Some(before_fps[cursor].n);
-                cursor += 1;
-                break;
-            }
-            if have > want {
-                break;
-            }
-            cursor += 1;
-        }
-        let Some(index) = matched else {
-            return Err(HostError::Ffmpeg(
-                "extract refuses a sample with no source frame".into(),
-            ));
-        };
-        indexes.push(index);
+fn read_source_stamps(path: &Path, written: usize) -> Result<Vec<u64>> {
+    let bytes = std::fs::read(path)
+        .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))?;
+    if !bytes.len().is_multiple_of(3) {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame that does not match the pictures".into(),
+        ));
+    }
+    let frames = bytes.len() / 3;
+    if frames < written {
+        return Err(HostError::Ffmpeg(format!(
+            "extract refuses a source frame that does not match the pictures: logged {frames}, wrote {written}"
+        )));
+    }
+    let mut indexes = Vec::with_capacity(written);
+    for index in 0..written {
+        let at = index * 3;
+        indexes.push(stamp_index([bytes[at], bytes[at + 1], bytes[at + 2]])?);
     }
     Ok(indexes)
+}
+
+fn stamp_index(rgb: [u8; 3]) -> Result<u64> {
+    if rgb == [255, 255, 255] {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a source frame whose index does not fit".into(),
+        ));
+    }
+    Ok(u64::from(rgb[0]) | (u64::from(rgb[1]) << 8) | (u64::from(rgb[2]) << 16))
+}
+
+fn repeat_of(indexes: &[u64]) -> Vec<Option<u64>> {
+    let mut first_sample = std::collections::HashMap::<u64, u64>::new();
+    let mut repeats = Vec::with_capacity(indexes.len());
+    for (sample, source) in indexes.iter().enumerate() {
+        let Ok(sample) = u64::try_from(sample) else {
+            repeats.push(None);
+            continue;
+        };
+        if let Some(first) = first_sample.get(source) {
+            repeats.push(Some(*first));
+        } else {
+            first_sample.insert(*source, sample);
+            repeats.push(None);
+        }
+    }
+    repeats
 }
 
 trait MutableTiming {
@@ -1313,6 +1379,7 @@ mod tests {
         RgbFrame {
             index,
             source_index: index,
+            duplicate_of: None,
             ticks,
             timescale: 1_000_000,
             width: 1,
@@ -1322,54 +1389,160 @@ mod tests {
     }
 
     #[test]
-    fn source_index_is_not_the_sample_or_the_pts() {
-        let log = "\
-[Parsed_showinfo_0 @ 1] config in time_base: 1/30, frame_rate: 30/1
-[Parsed_showinfo_2 @ 1] config in time_base: 1/10, frame_rate: 10/1
-[Parsed_showinfo_0 @ 1] n:   0 pts: 0 pts_time:0 duration: 1 duration_time:0.0333333
-[Parsed_showinfo_2 @ 1] n:   0 pts: 0 pts_time:0 duration: 1 duration_time:0.1
-[Parsed_showinfo_0 @ 1] n:   3 pts: 3 pts_time:0.1 duration: 1 duration_time:0.0333333
-[Parsed_showinfo_2 @ 1] n:   1 pts: 1 pts_time:0.1 duration: 1 duration_time:0.1
-[Parsed_showinfo_0 @ 1] n:   6 pts: 6 pts_time:0.2 duration: 1 duration_time:0.0333333
-[Parsed_showinfo_2 @ 1] n:   2 pts: 2 pts_time:0.2 duration: 1 duration_time:0.1
-[Parsed_showinfo_2 @ 1] n:   3 pts: 3 pts_time:0.3 duration: 1 duration_time:0.1
-[Parsed_showinfo_0 @ 1] n:   9 pts: 9 pts_time:0.3 duration: 1 duration_time:0.0333333
-[Parsed_showinfo_2 @ 1] n:   4 pts: 4 pts_time:0.4 duration: 1 duration_time:0.1
+    fn source_stamp_is_not_a_showinfo_zip() {
+        let paired = "\
+[Parsed_showinfo_0 @ 1] n:   0 pts: 0 pts_time:0
+[Parsed_showinfo_2 @ 1] n:   0 pts: 0 pts_time:0
 ";
-        let (before_fps, after_fps) = show_streams(log).unwrap();
-        let after_fps = written_showinfo(&after_fps, 3).unwrap();
-        let indexes = source_indexes(&before_fps, &after_fps).unwrap();
-        assert_eq!(indexes, vec![0, 3, 6]);
-        assert_eq!(
-            after_fps.iter().map(|frame| frame.n).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
+        let Err(err) = sampled_showinfo(paired) else {
+            panic!("two showinfo logs were accepted as a source map");
+        };
+        assert!(err.to_string().contains("no source index"), "{err}");
+        assert_eq!(stamp_index([1, 0, 0]).unwrap(), 1);
+        assert_eq!(stamp_index([4, 0, 0]).unwrap(), 4);
+        assert_eq!(stamp_index([7, 0, 0]).unwrap(), 7);
+        assert_eq!(stamp_index([0, 1, 0]).unwrap(), 256);
+        let Err(err) = stamp_index([255, 255, 255]) else {
+            panic!("a saturated source stamp was accepted");
+        };
+        assert!(err.to_string().contains("does not fit"), "{err}");
+        assert_eq!(repeat_of(&[1, 4, 7]), vec![None, None, None]);
+        assert_eq!(repeat_of(&[0, 0, 1, 1]), vec![None, Some(0), None, Some(2)]);
+        let one = "\
+[Parsed_showinfo_1 @ 1] n:   0 pts: 0 pts_time:0
+[Parsed_showinfo_1 @ 1] n:   1 pts: 1 pts_time:0.1
+[Parsed_showinfo_1 @ 1] n:   2 pts: 2 pts_time:0.2
+";
+        let notes = sampled_showinfo(one).unwrap();
+        let Err(err) = written_showinfo(&notes, 4) else {
+            panic!("a short showinfo log was accepted");
+        };
+        assert!(err.to_string().contains("logged 3"), "{err}");
+        assert!(err.to_string().contains("wrote 4"), "{err}");
         let mut frames = [
             proxy_frame(0, 0),
             proxy_frame(1, 100_000),
             proxy_frame(2, 200_000),
         ];
-        apply_source_index(&mut frames, &indexes).unwrap();
+        apply_source_index(&mut frames, &[1, 4, 7]).unwrap();
         let map = ProxyMap::from_frames(&frames);
         assert_eq!(map.index_at(150_000, 1_000_000), Some(1));
-        assert_eq!(map.source_index_at(150_000, 1_000_000), Some(3));
+        assert_eq!(map.source_index_at(150_000, 1_000_000), Some(4));
         assert_ne!(map.source_index_at(150_000, 1_000_000), Some(1));
-        let Err(err) = written_showinfo(&after_fps, 4) else {
-            panic!("a short showinfo log was accepted");
-        };
-        assert!(err.to_string().contains("logged 3"), "{err}");
-        assert!(err.to_string().contains("wrote 4"), "{err}");
     }
 
     #[test]
-    fn decimated_extract_keeps_the_source_frame_number() {
+    fn sampled_source_index_matches_the_kept_picture() {
         if !ffmpeg_present() {
             return;
         }
         let dir = std::env::temp_dir().join(format!("rf-host-srcidx-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let video = dir.join("src.mp4");
+        let thirty = numbered_clip(&dir, "thirty.mov", 30, 15, "");
+        let frames_dir = dir.join("frames30");
+        let frames = extract_rgb_frames_limited(&thirty, &frames_dir, 10, 5).unwrap();
+        assert_eq!(source_of(&frames), vec![1, 4, 7, 10, 13]);
+        assert_eq!(
+            frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
+            vec![0, 100_000, 200_000, 300_000, 400_000]
+        );
+        assert!(frames.iter().all(|frame| frame.duplicate_of.is_none()));
+        assert!(!frames_dir.join("source-index.rgb").exists());
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(frames_dir.join("frames.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["source_index"],
+            serde_json::json!([1, 4, 7, 10, 13])
+        );
+        assert_eq!(
+            manifest["duplicate_of"],
+            serde_json::json!([null, null, null, null, null])
+        );
+
+        let twenty_four = numbered_clip(&dir, "twentyfour.mov", 24, 12, "");
+        let from_twenty_four =
+            extract_rgb_frames_limited(&twenty_four, &dir.join("frames24"), 10, 5).unwrap();
+        assert_eq!(source_of(&from_twenty_four), vec![1, 3, 5, 8, 10]);
+
+        let upsampled = numbered_clip(&dir, "ten.mov", 10, 5, "");
+        let doubled = extract_rgb_frames_limited(&upsampled, &dir.join("frames20"), 20, 8).unwrap();
+        assert_eq!(source_of(&doubled), vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        assert_eq!(
+            doubled
+                .iter()
+                .map(|frame| frame.duplicate_of)
+                .collect::<Vec<_>>(),
+            vec![None, Some(0), None, Some(2), None, Some(4), None, Some(6)]
+        );
+
+        let variable = numbered_clip(&dir, "vfr.mov", 30, 15, "setpts=N*N*0.02/TB");
+        let varied = extract_rgb_frames_limited(&variable, &dir.join("framesvfr"), 10, 8).unwrap();
+        assert_eq!(source_of(&varied), vec![1, 2, 3, 4, 4, 5, 5, 6]);
+
+        let shifted = numbered_clip(&dir, "neg.mov", 30, 30, "setpts=PTS-0.5/TB");
+        let after_negative =
+            extract_rgb_frames_limited(&shifted, &dir.join("framesneg"), 10, 3).unwrap();
+        let burned = burned_reds(&shifted);
+        assert_eq!(
+            after_negative
+                .iter()
+                .map(|frame| frame.source_index)
+                .collect::<Vec<_>>(),
+            vec![1, 4, 7]
+        );
+        for frame in &after_negative {
+            let stored = usize::try_from(frame.source_index).unwrap();
+            assert_eq!(
+                frame.rgb[0], burned[stored],
+                "sample {} kept a different picture than source {}",
+                frame.index, frame.source_index
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn burned_reds(video: &Path) -> Vec<u8> {
+        let raw = video.with_extension("raw");
+        let status = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(video)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24"])
+            .arg(&raw)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(&raw).unwrap();
+        bytes.chunks(16 * 16 * 3).map(|chunk| chunk[0]).collect()
+    }
+
+    fn source_of(frames: &[RgbFrame]) -> Vec<u64> {
+        frames
+            .iter()
+            .map(|frame| {
+                assert_eq!(
+                    u64::from(frame.rgb[0]),
+                    frame.source_index,
+                    "sample {} pixel {} source {}",
+                    frame.index,
+                    frame.rgb[0],
+                    frame.source_index
+                );
+                frame.source_index
+            })
+            .collect()
+    }
+
+    fn numbered_clip(dir: &Path, name: &str, rate: u32, frames: u32, setpts: &str) -> PathBuf {
+        let video = dir.join(name);
+        let mut filter = String::from("format=rgb24,geq=r='N':g='0':b='0'");
+        if !setpts.is_empty() {
+            filter.push(',');
+            filter.push_str(setpts);
+        }
+        let count = frames.to_string();
+        let source = format!("color=c=black:s=16x16:r={rate}:d=2");
         let status = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -1379,45 +1552,34 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "color=c=red:s=16x16:r=30:d=1",
+                &source,
+                "-vf",
+                &filter,
                 "-frames:v",
-                "30",
+                &count,
+                "-pix_fmt",
+                "rgb24",
+                "-c:v",
+                "png",
             ])
             .arg(&video)
             .status()
             .unwrap();
-        assert!(status.success());
-        let frames_dir = dir.join("frames");
-        let frames = extract_rgb_frames_limited(&video, &frames_dir, 10, 3).unwrap();
-        assert_eq!(
-            frames.iter().map(|frame| frame.index).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        assert_eq!(
-            frames
-                .iter()
-                .map(|frame| frame.source_index)
-                .collect::<Vec<_>>(),
-            vec![0, 3, 6]
-        );
-        assert_eq!(
-            frames.iter().map(|frame| frame.ticks).collect::<Vec<_>>(),
-            vec![0, 100_000, 200_000]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "{name}");
+        video
     }
 
     #[test]
     fn coverage_names_the_source_frames_that_were_observed() {
         let gapped = [
-            coverage_picture(0, 0),
-            coverage_picture(1, 3),
-            coverage_picture(2, 6),
+            coverage_picture(0, 1),
+            coverage_picture(1, 4),
+            coverage_picture(2, 7),
         ];
         let capped = sample_coverage(&gapped, 10, 3, 1.0);
         assert!(capped.hit_cap);
         assert!(!capped.covers_every_source_frame);
-        assert_eq!(capped.source_index, vec![0, 3, 6]);
+        assert_eq!(capped.source_index, vec![1, 4, 7]);
 
         let partial = sample_coverage(&gapped, 10, 30, 1.0);
         assert!(!partial.hit_cap);
@@ -1445,6 +1607,7 @@ mod tests {
         SampledPicture {
             index,
             source_index,
+            duplicate_of: None,
             ticks: 0,
             timescale: 1,
             path: PathBuf::from("unused.png"),
@@ -1471,6 +1634,7 @@ mod tests {
         let pictures = [SampledPicture {
             index: 0,
             source_index: 0,
+            duplicate_of: None,
             ticks: 0,
             timescale: 1,
             path: missing.clone(),
@@ -1515,6 +1679,7 @@ mod tests {
             SampledPicture {
                 index: 0,
                 source_index: 0,
+                duplicate_of: None,
                 ticks: 0,
                 timescale: 1,
                 path: first,
@@ -1522,6 +1687,7 @@ mod tests {
             SampledPicture {
                 index: 1,
                 source_index: 1,
+                duplicate_of: None,
                 ticks: 1,
                 timescale: 1,
                 path: dir.join("missing.png"),
