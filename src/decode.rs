@@ -2,11 +2,13 @@
 
 use crate::error::{HostError, Result};
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One sampled picture on disk. The RGB bytes stay in the PNG until loaded.
 #[derive(Debug, Clone)]
@@ -69,7 +71,7 @@ pub struct RgbFrame {
     pub duplicate_of: Option<u64>,
     /// Presentation ticks at [`Self::timescale`].
     ///
-    /// Sampled presentation time from `showinfo` after `fps`, in microseconds.
+    /// Sampled presentation time after the constant-frame-rate gate, in microseconds.
     pub ticks: i64,
     /// Ticks per second. `1_000_000` for a sampled presentation time.
     pub timescale: u32,
@@ -279,6 +281,7 @@ struct ProbeJson {
 struct ProbeStream {
     width: Option<u32>,
     height: Option<u32>,
+    time_base: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,7 +373,7 @@ pub fn probe_has_audio(path: &Path) -> Result<bool> {
 /// `0` is this cap, not the whole file. A longer source is not decoded into RGB.
 pub const ANALYSIS_MAX_FRAMES: u32 = 300;
 
-/// Microseconds. Source presentation times from `showinfo` use this clock.
+/// Microseconds. Sampled presentation times use this clock.
 const SOURCE_PTS_TIMESCALE: u32 = 1_000_000;
 
 /// A private directory for one extract. Two calls do not share a path.
@@ -408,8 +411,8 @@ pub fn extract_rgb_frames(video: &Path, out_dir: &Path, sample_fps: u32) -> Resu
 
 /// Flag a running extract can poll. Cloning shares the same flag.
 ///
-/// Cancelling kills only the ffmpeg process that extract owns. Another
-/// extract, and files outside that extract's directory, stay in place.
+/// Cancelling kills only the ffmpeg and ffprobe processes this extract owns.
+/// Another extract, and files outside that extract's directory, stay in place.
 #[derive(Clone, Debug)]
 pub struct ExtractCancel {
     flag: Arc<AtomicBool>,
@@ -492,12 +495,13 @@ pub fn extract_rgb_frames_cancellable(
 
 /// List capped pictures without decoding them into one RGB vector.
 ///
-/// ffmpeg still stops at `max_frames`. PNG tails are removed. `frames.json`
-/// records the cap. Call [`visit_rgb_batches`] to decode a few pictures at a time.
+/// The sampler keeps at most `max_frames` pictures. PNG tails are removed.
+/// `frames.json` records the cap. Call [`visit_rgb_batches`] to decode a few
+/// pictures at a time.
 ///
 /// # Errors
 ///
-/// A zero cap, ffmpeg failure, or a source stamp that does not match the pictures.
+/// A zero cap, ffmpeg failure, or a presentation time that does not match the pictures.
 pub fn extract_sampled_pictures(
     video: &Path,
     out_dir: &Path,
@@ -511,7 +515,7 @@ pub fn extract_sampled_pictures(
 ///
 /// # Errors
 ///
-/// Cancellation, a zero cap, ffmpeg failure, or a source stamp that does not match the pictures.
+/// Cancellation, a zero cap, ffmpeg failure, or a presentation time that does not match the pictures.
 pub fn extract_sampled_pictures_cancellable(
     video: &Path,
     out_dir: &Path,
@@ -534,49 +538,12 @@ pub fn extract_sampled_pictures_cancellable(
         expected_samples(video, sample_fps).is_some_and(|count| count > u64::from(max_frames));
     std::fs::create_dir_all(out_dir)?;
     clear_frame_pngs(out_dir)?;
-    let pattern = out_dir.join("frame_%06d.png");
     let _ = std::fs::remove_file(out_dir.join("source-index.rgb"));
-    let limit = max_frames.to_string();
-    let stderr = run_ffmpeg_extract(video, &pattern, sample_fps, &limit, cancel)?;
-
-    let mut pictures = Vec::new();
-    let mut index = 0_u64;
-    let cap = u64::from(max_frames);
-    while index < cap {
-        let path = out_dir.join(format!("frame_{index:06}.png"));
-        if !path.is_file() {
-            break;
-        }
-        pictures.push(SampledPicture {
-            index,
-            source_index: index,
-            duplicate_of: None,
-            ticks: i64::try_from(index).unwrap_or(0),
-            timescale: sample_fps,
-            path,
-        });
-        index += 1;
-    }
-    let mut extra = index;
-    loop {
-        let path = out_dir.join(format!("frame_{extra:06}.png"));
-        if !path.is_file() {
-            break;
-        }
-        std::fs::remove_file(&path)?;
-        extra += 1;
-    }
-    if pictures.is_empty() {
-        return Err(HostError::Ffmpeg(
-            "ffmpeg wrote no frames (empty or unreadable video)".into(),
-        ));
-    }
-    let indexes = lift_source_stamps(&pictures)?;
-    let sampled = sampled_showinfo(&stderr)?;
-    let sampled = written_showinfo(&sampled, pictures.len())?;
-    let sampled_pts: Vec<f64> = sampled.iter().map(|frame| frame.pts_time).collect();
-    apply_source_pts(&mut pictures, &sampled_pts)?;
-    apply_source_index(&mut pictures, &indexes)?;
+    let mut pictures = sample_decoded_pictures(video, out_dir, sample_fps, max_frames, cancel)?;
+    let indexes: Vec<u64> = pictures
+        .iter()
+        .map(|picture| picture.source_index)
+        .collect();
     for (picture, repeat) in pictures.iter_mut().zip(repeat_of(&indexes)) {
         picture.duplicate_of = repeat;
     }
@@ -665,82 +632,545 @@ fn write_frame_manifest(
         .map_err(|err| HostError::Ffmpeg(format!("frame manifest: {err}")))
 }
 
-fn sample_filter(sample_fps: u32) -> String {
-    // One output. The extra bottom row stores the decoded ordinal in one RGB
-    // pixel. `geq` writes planar GBR, and FFmpeg 6.1.1 `fps` only references
-    // that frame, so the next stamp can change the row while the picture stays.
-    // Packed `format=rgb24` copies the picture and the stamp together first.
-    // Nearest sampling keeps the ordinal exact. The row is removed in process.
-    format!(
-        "format=rgb24,pad=iw:ih+1:0:0:black,geq=r='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(N,256)),r(X,Y))':g='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/256),256)),g(X,Y))':b='if(eq(X,0)*eq(Y,H-1),if(gte(N,16777215),255,mod(floor(N/65536),256)),b(X,Y))':interpolation=nearest,format=rgb24,fps={sample_fps},format=rgb24,showinfo"
-    )
+struct InputClock {
+    width: u32,
+    height: u32,
+    time_num: i64,
+    time_den: i64,
+    duration_secs: f64,
 }
 
-fn run_ffmpeg_extract(
-    video: &Path,
-    pattern: &Path,
-    sample_fps: u32,
-    limit: &str,
-    cancel: Option<&ExtractCancel>,
-) -> Result<String> {
-    if cancel.is_some_and(ExtractCancel::is_cancelled) {
-        return Err(HostError::Ffmpeg("extract cancelled".into()));
+struct HeldFrame {
+    source_index: u64,
+    out_pts: i64,
+    rgb: Vec<u8>,
+}
+
+#[derive(Default)]
+struct FpsGate {
+    held: [Option<HeldFrame>; 2],
+    count: usize,
+    next_pts: Option<i64>,
+}
+
+impl FpsGate {
+    fn push_held(
+        &mut self,
+        frame: HeldFrame,
+        room: usize,
+        emit: &mut impl FnMut(u64, i64, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        if room == 0 || self.count >= 2 {
+            return Ok(());
+        }
+        self.held[self.count] = Some(frame);
+        self.count += 1;
+        self.pump(false, 0, room, emit)
     }
-    let log_path = pattern.with_file_name(".extract-stderr.txt");
-    let log_file = std::fs::File::create(&log_path)
-        .map_err(|err| HostError::Ffmpeg(format!("extract log: {err}")))?;
-    let graph = sample_filter(sample_fps);
-    let mut child = Command::new("ffmpeg")
+
+    fn finish(
+        &mut self,
+        eof_pts: i64,
+        room: usize,
+        emit: &mut impl FnMut(u64, i64, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.pump(true, eof_pts, room, emit)
+    }
+
+    fn pump(
+        &mut self,
+        eof: bool,
+        eof_pts: i64,
+        room: usize,
+        emit: &mut impl FnMut(u64, i64, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut emitted = 0_usize;
+        while emitted < room {
+            if self.count == 0 || (self.count < 2 && !eof) {
+                break;
+            }
+            let Some(first_pts) = self.held[0].as_ref().map(|frame| frame.out_pts) else {
+                break;
+            };
+            let next = *self.next_pts.get_or_insert(first_pts);
+            let later_due = self
+                .held
+                .get(1)
+                .and_then(|frame| frame.as_ref())
+                .is_some_and(|frame| self.count == 2 && frame.out_pts <= next);
+            if later_due || (eof && eof_pts <= next) {
+                self.shift();
+                continue;
+            }
+            let Some(held) = self.held[0].as_ref() else {
+                break;
+            };
+            let source = held.source_index;
+            emit(source, next, held.rgb.as_slice())?;
+            emitted += 1;
+            self.next_pts = Some(next.saturating_add(1));
+        }
+        Ok(())
+    }
+
+    fn shift(&mut self) {
+        if self.count == 0 {
+            return;
+        }
+        self.held[0] = self.held[1].take();
+        self.count -= 1;
+    }
+}
+
+fn probe_input_clock(path: &Path) -> Result<InputClock> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,time_base",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|err| HostError::Ffmpeg(format!("ffprobe spawn: {err}")))?;
+    if !out.status.success() {
+        return Err(HostError::Ffmpeg(format!(
+            "ffprobe {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let parsed: ProbeJson = serde_json::from_slice(&out.stdout)?;
+    let stream = parsed
+        .streams
+        .and_then(|streams| streams.into_iter().next())
+        .ok_or_else(|| HostError::Ffmpeg("ffprobe: no video stream".into()))?;
+    let width = stream
+        .width
+        .ok_or_else(|| HostError::Ffmpeg("ffprobe: no width".into()))?;
+    let height = stream
+        .height
+        .ok_or_else(|| HostError::Ffmpeg("ffprobe: no height".into()))?;
+    let (time_num, time_den) = parse_time_base(stream.time_base.as_deref())?;
+    let duration_secs = parsed
+        .format
+        .and_then(|format| format.duration)
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(0.0);
+    Ok(InputClock {
+        width,
+        height,
+        time_num,
+        time_den,
+        duration_secs,
+    })
+}
+
+fn parse_time_base(raw: Option<&str>) -> Result<(i64, i64)> {
+    let Some(raw) = raw else {
+        return Err(HostError::Ffmpeg("ffprobe: no time base".into()));
+    };
+    let Some((num, den)) = raw.split_once('/') else {
+        return Err(HostError::Ffmpeg("ffprobe: no time base".into()));
+    };
+    let Ok(num) = num.parse::<i64>() else {
+        return Err(HostError::Ffmpeg("ffprobe: no time base".into()));
+    };
+    let Ok(den) = den.parse::<i64>() else {
+        return Err(HostError::Ffmpeg("ffprobe: no time base".into()));
+    };
+    if num <= 0 || den <= 0 {
+        return Err(HostError::Ffmpeg("ffprobe: no time base".into()));
+    }
+    Ok((num, den))
+}
+
+fn frame_bytes(width: u32, height: u32) -> Result<usize> {
+    let Ok(width) = usize::try_from(width) else {
+        return Err(HostError::Ffmpeg("ffprobe: no width".into()));
+    };
+    let Ok(height) = usize::try_from(height) else {
+        return Err(HostError::Ffmpeg("ffprobe: no height".into()));
+    };
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| HostError::Ffmpeg("ffprobe: no width".into()))
+}
+
+/// `vf_fps` nearest rescale. `num` and `den` are the combined rational.
+fn rescale_near(value: i64, num: i64, den: i64) -> Option<i64> {
+    if den <= 0 || num < 0 || value == i64::MAX || value == i64::MIN {
+        return (value == i64::MAX || value == i64::MIN).then_some(value);
+    }
+    let negative = value < 0;
+    let magnitude = i128::from(value.unsigned_abs());
+    let scaled = magnitude
+        .checked_mul(i128::from(num))?
+        .checked_add(i128::from(den) / 2)?
+        / i128::from(den);
+    let signed = if negative { -scaled } else { scaled };
+    i64::try_from(signed).ok()
+}
+
+fn to_output_pts(pts: i64, time_num: i64, time_den: i64, sample_fps: u32) -> Result<i64> {
+    let Some(num) = time_num.checked_mul(i64::from(sample_fps)) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a presentation time that does not match the pictures".into(),
+        ));
+    };
+    rescale_near(pts, num, time_den).ok_or_else(|| {
+        HostError::Ffmpeg(
+            "extract refuses a presentation time that does not match the pictures".into(),
+        )
+    })
+}
+
+fn output_ticks(out_pts: i64, sample_fps: u32) -> Result<i64> {
+    if out_pts < 0 || sample_fps == 0 {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a presentation time that does not match the pictures".into(),
+        ));
+    }
+    let fps = i128::from(sample_fps);
+    let ticks = (i128::from(out_pts) * 1_000_000 + fps / 2) / fps;
+    i64::try_from(ticks).map_err(|_| {
+        HostError::Ffmpeg(
+            "extract refuses a presentation time that does not match the pictures".into(),
+        )
+    })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn eof_output_pts(clock: &InputClock, sample_fps: u32) -> Option<i64> {
+    if !(clock.duration_secs.is_finite() && clock.duration_secs > 0.0) {
+        return None;
+    }
+    let ticks = (clock.duration_secs * clock.time_den as f64 / clock.time_num as f64).round();
+    if !ticks.is_finite() || ticks < 0.0 || ticks > i64::MAX as f64 {
+        return None;
+    }
+    to_output_pts(ticks as i64, clock.time_num, clock.time_den, sample_fps).ok()
+}
+
+fn write_rgb_png(path: &Path, rgb: &[u8], width: u32, height: u32) -> Result<()> {
+    image::save_buffer_with_format(
+        path,
+        rgb,
+        width,
+        height,
+        image::ExtendedColorType::Rgb8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|err| HostError::Ffmpeg(format!("frame png: {err}")))
+}
+
+type RawFrame = std::result::Result<Option<Vec<u8>>, String>;
+type RawPts = std::result::Result<Option<i64>, String>;
+
+fn read_raw_frames(mut input: impl Read, len: usize, tx: mpsc::SyncSender<RawFrame>) {
+    loop {
+        let mut buf = vec![0_u8; len];
+        let mut filled = 0_usize;
+        loop {
+            if filled == len {
+                break;
+            }
+            match input.read(&mut buf[filled..]) {
+                Ok(0) if filled == 0 => {
+                    let _ = tx.send(Ok(None));
+                    return;
+                }
+                Ok(0) => {
+                    let _ = tx.send(Err(
+                        "extract refuses a presentation time that does not match the pictures"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    let _ = tx.send(Err(err.to_string()));
+                    return;
+                }
+            }
+        }
+        if tx.send(Ok(Some(buf))).is_err() {
+            return;
+        }
+    }
+}
+
+fn read_pts_lines(input: impl Read, tx: mpsc::SyncSender<RawPts>) {
+    let mismatched = "extract refuses a presentation time that does not match the pictures";
+    for line in BufReader::new(input).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                let _ = tx.send(Err(err.to_string()));
+                return;
+            }
+        };
+        let line = line.trim();
+        // csv=p=0 can print a trailing comma on the first h264 timestamp (`0,`).
+        let Some(field) = line
+            .split(',')
+            .map(str::trim)
+            .find(|field| !field.is_empty())
+        else {
+            continue;
+        };
+        if field == "N/A" {
+            if tx.send(Ok(None)).is_err() {
+                return;
+            }
+            continue;
+        }
+        if let Ok(pts) = field.parse::<i64>() {
+            if tx.send(Ok(Some(pts))).is_err() {
+                return;
+            }
+        } else {
+            let _ = tx.send(Err(mismatched.to_string()));
+            return;
+        }
+    }
+}
+
+fn recv_matching(
+    rx: &mpsc::Receiver<RawPts>,
+    cancel: Option<&ExtractCancel>,
+) -> Result<Option<i64>> {
+    let started = std::time::Instant::now();
+    loop {
+        if cancel.is_some_and(ExtractCancel::is_cancelled) {
+            return Err(HostError::Ffmpeg("extract cancelled".into()));
+        }
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(Ok(pts)) => return Ok(pts),
+            Ok(Err(err)) => return Err(HostError::Ffmpeg(err)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(HostError::Ffmpeg(
+                    "extract refuses a presentation time that does not match the pictures".into(),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if started.elapsed() > Duration::from_secs(10) => {
+                return Err(HostError::Ffmpeg(
+                    "extract refuses a presentation time that does not match the pictures".into(),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn stop_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn sample_decoded_pictures(
+    video: &Path,
+    out_dir: &Path,
+    sample_fps: u32,
+    max_frames: u32,
+    cancel: Option<&ExtractCancel>,
+) -> Result<Vec<SampledPicture>> {
+    let clock = probe_input_clock(video)?;
+    let frame_len = frame_bytes(clock.width, clock.height)?;
+    let mut ffmpeg = Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
-            "info",
+            "error",
             "-threads",
             "1",
             "-filter_threads",
             "1",
-            "-sws_flags",
-            "neighbor",
-            "-y",
+            "-nostats",
             "-i",
         ])
         .arg(video)
         .args([
             "-vf",
-            &graph,
+            "format=rgb24",
+            "-an",
             "-fps_mode",
             "passthrough",
+            "-f",
+            "rawvideo",
             "-pix_fmt",
             "rgb24",
-            "-start_number",
-            "0",
-            "-frames:v",
-            limit,
+            "-",
         ])
-        .arg(pattern)
-        .stderr(Stdio::from(log_file))
-        .stdout(Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| HostError::Ffmpeg(format!("ffmpeg spawn: {err}")))?;
-    let status = match wait_ffmpeg(&mut child, cancel) {
-        Ok(status) => status,
-        Err(err) => {
-            let _ = std::fs::remove_file(&log_path);
-            return Err(err);
-        }
-    };
-    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&log_path);
-    if !status.success() {
-        let tail: String = stderr.chars().rev().take(400).collect();
-        let tail: String = tail.chars().rev().collect();
-        return Err(HostError::Ffmpeg(format!(
-            "ffmpeg extract frames failed ({status}): {tail}"
-        )));
+    let mut ffprobe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=best_effort_timestamp",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(video)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| HostError::Ffmpeg(format!("ffprobe spawn: {err}")))?;
+    let raw_out = ffmpeg
+        .stdout
+        .take()
+        .ok_or_else(|| HostError::Ffmpeg("ffmpeg spawn: no stdout".into()))?;
+    let raw_err = ffmpeg
+        .stderr
+        .take()
+        .ok_or_else(|| HostError::Ffmpeg("ffmpeg spawn: no stderr".into()))?;
+    let pts_out = ffprobe
+        .stdout
+        .take()
+        .ok_or_else(|| HostError::Ffmpeg("ffprobe spawn: no stdout".into()))?;
+    let (frame_tx, frame_rx) = mpsc::sync_channel(2);
+    let (pts_tx, pts_rx) = mpsc::sync_channel(8);
+    let frames = thread::spawn(move || read_raw_frames(raw_out, frame_len, frame_tx));
+    let pts = thread::spawn(move || read_pts_lines(pts_out, pts_tx));
+    let logs = thread::spawn(move || {
+        let _ = std::io::copy(&mut BufReader::new(raw_err), &mut std::io::sink());
+    });
+    let mut gate = FpsGate::default();
+    let mut pictures = Vec::new();
+    let mut source_index = 0_u64;
+    let cap = u64::from(max_frames);
+    let outcome = collect_samples(
+        &clock,
+        sample_fps,
+        cap,
+        cancel,
+        &frame_rx,
+        &pts_rx,
+        &mut gate,
+        out_dir,
+        &mut pictures,
+        &mut source_index,
+    );
+    stop_child(&mut ffmpeg);
+    stop_child(&mut ffprobe);
+    drop(frame_rx);
+    drop(pts_rx);
+    let _ = frames.join();
+    let _ = pts.join();
+    let _ = logs.join();
+    outcome?;
+    if pictures.is_empty() {
+        return Err(HostError::Ffmpeg(
+            "ffmpeg wrote no frames (empty or unreadable video)".into(),
+        ));
     }
-    Ok(stderr)
+    Ok(pictures)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn collect_samples(
+    clock: &InputClock,
+    sample_fps: u32,
+    cap: u64,
+    cancel: Option<&ExtractCancel>,
+    frame_rx: &mpsc::Receiver<RawFrame>,
+    pts_rx: &mpsc::Receiver<RawPts>,
+    gate: &mut FpsGate,
+    out_dir: &Path,
+    pictures: &mut Vec<SampledPicture>,
+    source_index: &mut u64,
+) -> Result<()> {
+    loop {
+        if cancel.is_some_and(ExtractCancel::is_cancelled) {
+            return Err(HostError::Ffmpeg("extract cancelled".into()));
+        }
+        let stored = u64::try_from(pictures.len()).unwrap_or(u64::MAX);
+        if stored >= cap {
+            break;
+        }
+        let frame = match frame_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Err(err)) => return Err(HostError::Ffmpeg(err)),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+        };
+        let Some(raw_pts) = recv_matching(pts_rx, cancel)? else {
+            *source_index = source_index.saturating_add(1);
+            continue;
+        };
+        let ordinal = *source_index;
+        *source_index = source_index.saturating_add(1);
+        let out_pts = to_output_pts(raw_pts, clock.time_num, clock.time_den, sample_fps)?;
+        let room = usize::try_from(cap.saturating_sub(stored)).unwrap_or(usize::MAX);
+        gate.push_held(
+            HeldFrame {
+                source_index: ordinal,
+                out_pts,
+                rgb: frame,
+            },
+            room,
+            &mut |source, pts, rgb| {
+                store_sample(out_dir, clock, sample_fps, pictures, source, pts, rgb)
+            },
+        )?;
+    }
+    let stored = u64::try_from(pictures.len()).unwrap_or(u64::MAX);
+    if stored < cap {
+        let Some(eof_pts) = eof_output_pts(clock, sample_fps) else {
+            return Ok(());
+        };
+        let room = usize::try_from(cap.saturating_sub(stored)).unwrap_or(usize::MAX);
+        gate.finish(eof_pts, room, &mut |source, pts, rgb| {
+            store_sample(out_dir, clock, sample_fps, pictures, source, pts, rgb)
+        })?;
+    }
+    Ok(())
+}
+
+fn store_sample(
+    out_dir: &Path,
+    clock: &InputClock,
+    sample_fps: u32,
+    pictures: &mut Vec<SampledPicture>,
+    source: u64,
+    out_pts: i64,
+    rgb: &[u8],
+) -> Result<()> {
+    let Ok(index) = u64::try_from(pictures.len()) else {
+        return Err(HostError::Ffmpeg(
+            "extract refuses a presentation time that does not match the pictures".into(),
+        ));
+    };
+    let path = out_dir.join(format!("frame_{index:06}.png"));
+    write_rgb_png(&path, rgb, clock.width, clock.height)?;
+    pictures.push(SampledPicture {
+        index,
+        source_index: source,
+        duplicate_of: None,
+        ticks: output_ticks(out_pts, sample_fps)?,
+        timescale: SOURCE_PTS_TIMESCALE,
+        path,
+    });
+    Ok(())
+}
+
+#[cfg(test)]
 fn wait_ffmpeg(
     child: &mut std::process::Child,
     cancel: Option<&ExtractCancel>,
@@ -759,6 +1189,7 @@ fn wait_ffmpeg(
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct ShowFrame {
     pts_time: f64,
@@ -766,6 +1197,7 @@ struct ShowFrame {
 
 /// `-frames:v` stops the pictures. `showinfo` can keep logging frames after that.
 /// The written pictures are the first logged samples, in order.
+#[cfg(test)]
 fn written_showinfo(notes: &[ShowFrame], written: usize) -> Result<Vec<ShowFrame>> {
     if notes.len() < written {
         return Err(HostError::Ffmpeg(format!(
@@ -776,6 +1208,7 @@ fn written_showinfo(notes: &[ShowFrame], written: usize) -> Result<Vec<ShowFrame
     Ok(notes.iter().take(written).copied().collect())
 }
 
+#[cfg(test)]
 fn sampled_showinfo(stderr: &str) -> Result<Vec<ShowFrame>> {
     let groups = showinfo_groups(stderr);
     let mut groups = groups.into_iter();
@@ -792,6 +1225,7 @@ fn sampled_showinfo(stderr: &str) -> Result<Vec<ShowFrame>> {
     Ok(sampled)
 }
 
+#[cfg(test)]
 fn showinfo_groups(stderr: &str) -> Vec<Vec<ShowFrame>> {
     let mut order = Vec::new();
     let mut groups = Vec::new();
@@ -813,6 +1247,7 @@ fn showinfo_groups(stderr: &str) -> Vec<Vec<ShowFrame>> {
     groups
 }
 
+#[cfg(test)]
 fn showinfo_instance(line: &str) -> Option<u32> {
     let pos = line.find("showinfo_")?;
     let rest = &line[pos + "showinfo_".len()..];
@@ -822,6 +1257,7 @@ fn showinfo_instance(line: &str) -> Option<u32> {
     rest[..end].parse().ok()
 }
 
+#[cfg(test)]
 fn showinfo_frame(line: &str) -> Option<ShowFrame> {
     let n_at = line.find("n:")?;
     let n_token = line[n_at + 2..].split_whitespace().next()?;
@@ -835,109 +1271,6 @@ fn showinfo_frame(line: &str) -> Option<ShowFrame> {
         return None;
     }
     Some(ShowFrame { pts_time })
-}
-
-fn lift_source_stamps(pictures: &[SampledPicture]) -> Result<Vec<u64>> {
-    let mut indexes = Vec::with_capacity(pictures.len());
-    for picture in pictures {
-        let bytes = std::fs::read(&picture.path)
-            .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))?;
-        let decoded = sightloom_host::decode_encoded_rgb(&bytes)
-            .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))?;
-        indexes.push(stamp_from_picture(
-            &decoded.rgb,
-            decoded.width,
-            decoded.height,
-        )?);
-        write_picture_without_stamp(&picture.path, &decoded)?;
-    }
-    Ok(indexes)
-}
-
-fn stamp_from_picture(rgb: &[u8], width: u32, height: u32) -> Result<u64> {
-    if height < 2 || width == 0 {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    }
-    let Ok(wide) = usize::try_from(width) else {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    };
-    let Ok(high) = usize::try_from(height) else {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    };
-    let Some(stride) = wide.checked_mul(3) else {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    };
-    let Some(needed) = stride.checked_mul(high) else {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    };
-    if rgb.len() < needed {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    }
-    let at = stride * (high - 1);
-    stamp_index([rgb[at], rgb[at + 1], rgb[at + 2]])
-}
-
-fn write_picture_without_stamp(path: &Path, decoded: &sightloom_host::DecodedRgb) -> Result<()> {
-    let Ok(wide) = usize::try_from(decoded.width) else {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    };
-    let Ok(high) = usize::try_from(decoded.height) else {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    };
-    if high < 2 {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    }
-    let Some(stride) = wide.checked_mul(3) else {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    };
-    let Some(keep) = stride.checked_mul(high - 1) else {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    };
-    if decoded.rgb.len() < keep {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame that does not match the pictures".into(),
-        ));
-    }
-    image::save_buffer_with_format(
-        path,
-        &decoded.rgb[..keep],
-        decoded.width,
-        decoded.height - 1,
-        image::ExtendedColorType::Rgb8,
-        image::ImageFormat::Png,
-    )
-    .map_err(|err| HostError::Ffmpeg(format!("extract source stamp: {err}")))
-}
-
-fn stamp_index(rgb: [u8; 3]) -> Result<u64> {
-    if rgb == [255, 255, 255] {
-        return Err(HostError::Ffmpeg(
-            "extract refuses a source frame whose index does not fit".into(),
-        ));
-    }
-    Ok(u64::from(rgb[0]) | (u64::from(rgb[1]) << 8) | (u64::from(rgb[2]) << 16))
 }
 
 fn repeat_of(indexes: &[u64]) -> Vec<Option<u64>> {
@@ -958,11 +1291,13 @@ fn repeat_of(indexes: &[u64]) -> Vec<Option<u64>> {
     repeats
 }
 
+#[cfg(test)]
 trait MutableTiming {
     fn write_ticks(&mut self, ticks: i64, timescale: u32);
     fn write_source_index(&mut self, index: u64);
 }
 
+#[cfg(test)]
 impl MutableTiming for RgbFrame {
     fn write_ticks(&mut self, ticks: i64, timescale: u32) {
         self.ticks = ticks;
@@ -974,6 +1309,7 @@ impl MutableTiming for RgbFrame {
     }
 }
 
+#[cfg(test)]
 impl MutableTiming for SampledPicture {
     fn write_ticks(&mut self, ticks: i64, timescale: u32) {
         self.ticks = ticks;
@@ -985,6 +1321,7 @@ impl MutableTiming for SampledPicture {
     }
 }
 
+#[cfg(test)]
 fn apply_source_index<T: MutableTiming>(frames: &mut [T], indexes: &[u64]) -> Result<()> {
     if indexes.len() != frames.len() {
         return Err(HostError::Ffmpeg(
@@ -997,6 +1334,7 @@ fn apply_source_index<T: MutableTiming>(frames: &mut [T], indexes: &[u64]) -> Re
     Ok(())
 }
 
+#[cfg(test)]
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn pts_ticks(secs: f64) -> Option<i64> {
     if !secs.is_finite() || secs < 0.0 {
@@ -1009,6 +1347,7 @@ fn pts_ticks(secs: f64) -> Option<i64> {
     Some(ticks as i64)
 }
 
+#[cfg(test)]
 fn apply_source_pts<T: MutableTiming>(frames: &mut [T], source_pts: &[f64]) -> Result<()> {
     if source_pts.len() != frames.len() {
         return Err(HostError::Ffmpeg(
@@ -1461,7 +1800,52 @@ mod tests {
     }
 
     #[test]
-    fn source_stamp_is_not_a_showinfo_zip() {
+    fn pts_csv_keeps_the_first_timestamp_field() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        read_pts_lines(std::io::Cursor::new("0,\n1024\nN/A\n,\n"), tx);
+        assert_eq!(rx.recv().unwrap().unwrap(), Some(0));
+        assert_eq!(rx.recv().unwrap().unwrap(), Some(1024));
+        assert_eq!(rx.recv().unwrap().unwrap(), None);
+        assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn fps_keeps_the_frame_ffmpeg_keeps() {
+        let thirty: Vec<i64> = (0..15).map(|n| n * 512).collect();
+        assert_eq!(kept_sources(10, &thirty, 5), vec![1, 4, 7, 10, 13]);
+        let ten: Vec<i64> = (0..5).map(|n| n * 1536).collect();
+        assert_eq!(kept_sources(20, &ten, 8), vec![0, 0, 1, 1, 2, 2, 3, 3]);
+    }
+
+    fn kept_sources(sample_fps: u32, pts: &[i64], room: usize) -> Vec<u64> {
+        let mut gate = FpsGate::default();
+        let mut kept = Vec::new();
+        for (ordinal, raw) in pts.iter().copied().enumerate() {
+            let left = room.saturating_sub(kept.len());
+            if left == 0 {
+                break;
+            }
+            let out_pts = to_output_pts(raw, 1, 15_360, sample_fps).unwrap();
+            let source = u64::try_from(ordinal).unwrap();
+            gate.push_held(
+                HeldFrame {
+                    source_index: source,
+                    out_pts,
+                    rgb: vec![0],
+                },
+                left,
+                &mut |source, _out, _rgb| {
+                    kept.push(source);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        kept
+    }
+
+    #[test]
+    fn showinfo_zip_is_not_a_source_map() {
         let paired = "\
 [Parsed_showinfo_0 @ 1] n:   0 pts: 0 pts_time:0
 [Parsed_showinfo_2 @ 1] n:   0 pts: 0 pts_time:0
@@ -1470,30 +1854,8 @@ mod tests {
             panic!("two showinfo logs were accepted as a source map");
         };
         assert!(err.to_string().contains("no source index"), "{err}");
-        assert_eq!(stamp_index([1, 0, 0]).unwrap(), 1);
-        assert_eq!(stamp_index([4, 0, 0]).unwrap(), 4);
-        assert_eq!(stamp_index([7, 0, 0]).unwrap(), 7);
-        assert_eq!(stamp_index([0, 1, 0]).unwrap(), 256);
-        let Err(err) = stamp_index([255, 255, 255]) else {
-            panic!("a saturated source stamp was accepted");
-        };
-        assert!(err.to_string().contains("does not fit"), "{err}");
         assert_eq!(repeat_of(&[1, 4, 7]), vec![None, None, None]);
         assert_eq!(repeat_of(&[0, 0, 1, 1]), vec![None, Some(0), None, Some(2)]);
-        let mut rgb = vec![9_u8; 3 * 3 * 2];
-        let stamp_at = 3 * 3;
-        rgb[stamp_at] = 2;
-        rgb[stamp_at + 1] = 0;
-        rgb[stamp_at + 2] = 1;
-        assert_eq!(stamp_from_picture(&rgb, 3, 2).unwrap(), 65_538);
-        let Err(err) = stamp_from_picture(&rgb, 3, 1) else {
-            panic!("a picture with no stamp row was accepted");
-        };
-        assert!(err.to_string().contains("does not match"), "{err}");
-        let Err(err) = stamp_from_picture(&rgb[..3], 3, 2) else {
-            panic!("a short picture was accepted");
-        };
-        assert!(err.to_string().contains("does not match"), "{err}");
         let one = "\
 [Parsed_showinfo_1 @ 1] n:   0 pts: 0 pts_time:0
 [Parsed_showinfo_1 @ 1] n:   1 pts: 1 pts_time:0.1
@@ -1510,6 +1872,28 @@ mod tests {
             proxy_frame(1, 100_000),
             proxy_frame(2, 200_000),
         ];
+        apply_source_pts(
+            &mut frames,
+            &[notes[0].pts_time, notes[1].pts_time, notes[2].pts_time],
+        )
+        .unwrap();
+        assert_eq!(frames[1].ticks, 100_000);
+        let Err(err) = apply_source_pts(&mut frames, &[0.0, -0.1, 0.2]) else {
+            panic!("a negative presentation time was accepted");
+        };
+        assert!(err.to_string().contains("does not match"), "{err}");
+        let mut pictures = [SampledPicture {
+            index: 0,
+            source_index: 0,
+            duplicate_of: None,
+            ticks: 0,
+            timescale: 1,
+            path: PathBuf::from("unused.png"),
+        }];
+        apply_source_index(&mut pictures, &[4]).unwrap();
+        apply_source_pts(&mut pictures, &[0.2]).unwrap();
+        assert_eq!(pictures[0].source_index, 4);
+        assert_eq!(pictures[0].ticks, 200_000);
         apply_source_index(&mut frames, &[1, 4, 7]).unwrap();
         let map = ProxyMap::from_frames(&frames);
         assert_eq!(map.index_at(150_000, 1_000_000), Some(1));
