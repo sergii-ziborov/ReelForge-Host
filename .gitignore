@@ -6,3 +6,5 @@
 *.swp
 .sightloom-models/
 /work/
+/.runtime/
+*.sqlite*

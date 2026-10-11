@@ -38,7 +38,7 @@ pub use decode::{
     is_live_token, materialize_video, probe_has_audio, probe_video, sample_coverage,
     visit_rgb_batches, visit_rgb_batches_cancellable,
 };
-pub use encode::run_graph;
+pub use encode::{run_graph, run_graph_controlled};
 pub use error::{HostError, MISSING_WEIGHTS_EXIT, Result};
 pub use http::{
     DEFAULT_HTTP_BIND, HttpServeOpts, is_loopback_bind, require_token_for_bind, serve_http,

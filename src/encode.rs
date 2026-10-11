@@ -20,7 +20,11 @@ pub fn run_graph(
     run_graph_controlled(graph_path, mask_package, output, &WriteControl::default())
 }
 
-pub(crate) fn run_graph_controlled(
+/// Encode a saved native graph with caller-provided cancellation and progress.
+///
+/// # Errors
+/// Parse, package open, cancellation, encode, or missing output file.
+pub fn run_graph_controlled(
     graph_path: &Path,
     mask_package: Option<&Path>,
     output: Option<&Path>,
