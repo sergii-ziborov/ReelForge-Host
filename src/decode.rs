@@ -1013,6 +1013,8 @@ fn sample_decoded_pictures(
         ])
         .arg(video)
         .args([
+            "-map",
+            "0:v:0",
             "-an",
             "-fps_mode",
             "passthrough",
@@ -1978,6 +1980,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn multistream_extract_uses_the_probed_first_video_stream() {
+        if !ffmpeg_present() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("two-streams.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=16x16:r=2:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=32x32:r=2:d=1",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:v:0",
+                "-c:v",
+                "ffv1",
+                "-disposition:v:0",
+                "0",
+                "-disposition:v:1",
+                "default",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let frames = extract_rgb_frames_limited(&video, &dir.path().join("frames"), 2, 2).unwrap();
+        assert_eq!(frames.len(), 2);
+        for frame in frames {
+            assert_eq!(
+                (frame.width, frame.height, frame.rgb.len()),
+                (16, 16, 16 * 16 * 3)
+            );
+            assert!(
+                frame.rgb[0] > 240 && frame.rgb[2] < 10,
+                "decoder selected a different video stream"
+            );
+        }
+    }
+
     fn assert_resampled(frames: &[RgbFrame]) {
         assert!(
             frames.iter().any(|frame| frame.source_index != frame.index),
@@ -2136,6 +2187,41 @@ mod tests {
             timescale: 1,
             path: PathBuf::from("unused.png"),
         }
+    }
+
+    #[test]
+    fn identity_evidence_loads_the_source_picture_after_resampling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pictures = Vec::new();
+        for (index, source, color) in [
+            (0, 1, [255, 0, 0]),
+            (1, 4, [0, 255, 0]),
+            (2, 7, [0, 0, 255]),
+            (3, 7, [0, 0, 255]),
+        ] {
+            let path = dir.path().join(format!("{index}.png"));
+            image::save_buffer(&path, &color, 1, 1, image::ColorType::Rgb8).unwrap();
+            pictures.push(SampledPicture {
+                index,
+                source_index: source,
+                duplicate_of: (index == 3).then_some(2),
+                ticks: i64::try_from(index).unwrap(),
+                timescale: 1,
+                path,
+            });
+        }
+        let by_source = crate::vision::source_picture_index(&pictures);
+        assert_eq!(by_source.get(&7).unwrap().index, 2);
+        for (source, expected) in [(1, [255, 0, 0]), (4, [0, 255, 0]), (7, [0, 0, 255])] {
+            let frame = by_source
+                .get(&source)
+                .expect("source picture")
+                .load()
+                .unwrap();
+            assert_eq!(frame.rgb, expected);
+            assert_eq!(frame.source_index, source);
+        }
+        assert!(!by_source.contains_key(&0));
     }
 
     #[test]

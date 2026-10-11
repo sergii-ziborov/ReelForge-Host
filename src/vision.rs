@@ -249,10 +249,7 @@ pub fn merge_keep_identity(
         }
         reid.insert((h.source_id, h.track_id), h.score);
     }
-    let picture_by_index: HashMap<u64, &SampledPicture> = pictures
-        .iter()
-        .map(|picture| (picture.index, picture))
-        .collect();
+    let picture_by_index = source_picture_index(pictures);
     let photo_fallback = clothing_mean(photo_rgb, photo_w, photo_h);
 
     let mut by_frame: HashMap<u64, Vec<sightloom_index::TrackSample>> = HashMap::new();
@@ -505,6 +502,16 @@ fn load_indexed_picture(
         return Ok(None);
     };
     picture.load().map(Some)
+}
+
+pub(crate) fn source_picture_index(pictures: &[SampledPicture]) -> HashMap<u64, &SampledPicture> {
+    // TrackSample.frame_index comes from FrameStamp's source ordinal. Proxy
+    // ordinals are a separate clock; an upsampled duplicate keeps the first RGB.
+    let mut by_source = HashMap::with_capacity(pictures.len());
+    for picture in pictures {
+        by_source.entry(picture.source_index).or_insert(picture);
+    }
+    by_source
 }
 
 fn track_clothing_mean(
