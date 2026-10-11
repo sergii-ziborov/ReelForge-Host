@@ -102,8 +102,20 @@ pub(super) fn run(
 
 #[cfg(not(windows))]
 fn command(args: &[String]) -> Result<Command> {
-    let mut command =
-        Command::new(std::env::var_os("REELFORGE_CODEX").unwrap_or_else(|| "codex".into()));
+    let configured = std::env::var_os("REELFORGE_CODEX").map(PathBuf::from);
+    let binary = configured
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|base| base.join("codex"))
+                    .find(|p| p.is_file())
+            })
+        })
+        .filter(|p| p.is_file())
+        .ok_or_else(|| {
+            HostError::message("Codex CLI not found; set REELFORGE_CODEX to its executable")
+        })?;
+    let mut command = Command::new(binary);
     command.args(args);
     Ok(command)
 }
