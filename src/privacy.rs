@@ -4,7 +4,7 @@ use crate::compile::{photo_binding, photo_except_plan, resolve_bridge};
 use crate::decode::{
     ExtractCancel, RGB_BATCH_FRAMES, SampleCoverage, applied_frame_cap, extract_sampled_pictures,
     extract_sampled_pictures_cancellable, fresh_frames_dir, materialize_video, probe_video,
-    sample_coverage, visit_rgb_batches, visit_rgb_batches_cancellable,
+    refuse_cancelled, sample_coverage, visit_rgb_batches, visit_rgb_batches_cancellable,
 };
 use crate::encode::run_graph;
 use crate::error::Result;
@@ -99,11 +99,17 @@ pub enum AudioStatus {
 
 /// Full pipeline. Missing weights → [`crate::HostError::MissingWeights`] (exit 2).
 ///
+/// A flag that is already cancelled does not start a grab, save a package, or
+/// encode. A grab or encode that has already started is not killed, and a file
+/// it finished writing is not deleted. The function still returns an error
+/// instead of [`PrivacyExceptResult`]. That is not a rollback of another job.
+///
 /// # Errors
 ///
-/// Weights, ffmpeg, photo not Accept, compile, encode.
+/// Cancellation, weights, ffmpeg, photo not Accept, compile, encode.
 #[allow(clippy::too_many_lines)]
 pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
+    refuse_cancelled(opts.cancel.as_ref())?;
     let _ = crate::models::require_weights(&opts.models_dir).map_err(|e| {
         if let crate::error::HostError::MissingWeights(msg) = e {
             crate::error::HostError::MissingWeights(format!(
@@ -116,6 +122,7 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     })?;
     let t0 = Instant::now();
     std::fs::create_dir_all(&opts.work_dir)?;
+    refuse_cancelled(opts.cancel.as_ref())?;
     let video = materialize_video(&opts.video, &opts.work_dir, opts.live_secs.max(0.2))?;
     let info = probe_video(&video)?;
     let max_frames = applied_frame_cap(opts.max_frames);
@@ -205,6 +212,7 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     let t_compile = Instant::now();
 
     let package = opts.work_dir.join("vision_index");
+    refuse_cancelled(opts.cancel.as_ref())?;
     save_package(&pipe, &package)?;
 
     let plan = photo_except_plan(&video, &opts.photo, photo_box, &opts.output);
@@ -225,11 +233,14 @@ pub fn privacy_except(opts: &PrivacyExceptOpts) -> Result<PrivacyExceptResult> {
     let compile_ms = elapsed_ms(t_compile);
 
     let t_encode = Instant::now();
+    refuse_cancelled(opts.cancel.as_ref())?;
     let written = run_graph(
         &bridged.graph_path,
         Some(&bridged.mask_package),
         Some(&opts.output),
     )?;
+    // An encode that already finished is left on disk. It is still not accepted.
+    refuse_cancelled(opts.cancel.as_ref())?;
     let encode_ms = elapsed_ms(t_encode);
     let out_audio = crate::decode::probe_has_audio(Path::new(&written))?;
     if info.has_audio && !out_audio {

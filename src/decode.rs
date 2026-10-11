@@ -413,6 +413,8 @@ pub fn extract_rgb_frames(video: &Path, out_dir: &Path, sample_fps: u32) -> Resu
 ///
 /// Cancelling kills only the ffmpeg and ffprobe processes this extract owns.
 /// Another extract, and files outside that extract's directory, stay in place.
+/// A grab or encode that has already started is not killed. Callers refuse the
+/// result when the flag is set. That refusal is not a rollback of the movie.
 #[derive(Clone, Debug)]
 pub struct ExtractCancel {
     flag: Arc<AtomicBool>,
@@ -447,6 +449,18 @@ impl ExtractCancel {
 impl Default for ExtractCancel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Refuse work when `cancel` is already set.
+///
+/// The check does not stop a grab or encode that has already started, and it
+/// does not delete another request's files.
+pub(crate) fn refuse_cancelled(cancel: Option<&ExtractCancel>) -> Result<()> {
+    if cancel.is_some_and(ExtractCancel::is_cancelled) {
+        Err(HostError::Ffmpeg("extract cancelled".into()))
+    } else {
+        Ok(())
     }
 }
 

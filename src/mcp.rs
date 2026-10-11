@@ -3,7 +3,7 @@
 use crate::compile::{parse_redaction_kind, photo_binding, resolve_bridge};
 use crate::decode::{
     ExtractCancel, RGB_BATCH_FRAMES, applied_frame_cap, extract_sampled_pictures_cancellable,
-    fresh_frames_dir, materialize_video, probe_video, sample_coverage,
+    fresh_frames_dir, materialize_video, probe_video, refuse_cancelled, sample_coverage,
     visit_rgb_batches_cancellable,
 };
 use crate::encode::run_graph;
@@ -452,10 +452,11 @@ fn ingest_video(svc: &mut HostService, args: &Value) -> Result<Value> {
     let live_secs = args.get("live_secs").and_then(Value::as_f64).unwrap_or(3.0);
     let max_frames =
         applied_frame_cap(args.get("max_frames").and_then(Value::as_u64).unwrap_or(0) as u32);
+    let cancel = svc.cancel.clone();
+    refuse_cancelled(Some(&cancel))?;
     let video = materialize_video(&video, &work, live_secs)?;
     let info = probe_video(&video)?;
     let frames_dir = fresh_frames_dir(&work);
-    let cancel = svc.cancel.clone();
     let pictures =
         extract_sampled_pictures_cancellable(&video, &frames_dir, fps, max_frames, Some(&cancel))?;
     let pipe = svc.ensure_pipe()?;
@@ -469,7 +470,10 @@ fn ingest_video(svc: &mut HostService, args: &Value) -> Result<Value> {
         Ok(())
     })?;
     let package = work.join("vision_index");
+    refuse_cancelled(Some(&cancel))?;
     save_package(pipe, &package)?;
+    // Scratch files from a race are not a commit. The success result is.
+    refuse_cancelled(Some(&cancel))?;
     svc.last_package = Some(package.clone());
     svc.work_dir = work;
     Ok(json!({
@@ -614,6 +618,50 @@ mod tests {
         let _next = svc.arm_request(&json!(5));
         assert!(!scope.is_cancelled());
         assert!(!scope.take_cancel_line(r#"{"jsonrpc":"2.0","method":"ping"}"#));
+    }
+
+    #[test]
+    fn cancelled_ingest_does_not_save_a_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("clip.mp4");
+        std::fs::write(&video, b"not-a-video").unwrap();
+        let work = dir.path().join("work");
+        let mut svc = HostService::new();
+        let scope = svc.cancel_scope();
+        let _guard = svc.arm_request(&json!(7));
+        assert!(scope.take_cancel_line(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#
+        ));
+        let err = ingest_video(
+            &mut svc,
+            &json!({
+                "video": video.to_string_lossy(),
+                "work_dir": work.to_string_lossy(),
+            }),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("extract cancelled"), "{text}");
+        assert!(svc.last_package.is_none());
+        assert!(!work.join("vision_index").exists());
+        assert!(!work.join("live.mp4").exists());
+    }
+
+    #[test]
+    fn uncancelled_ingest_still_requires_a_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut svc = HostService::new();
+        let err = ingest_video(
+            &mut svc,
+            &json!({
+                "video": dir.path().join("missing.mp4").to_string_lossy(),
+                "work_dir": dir.path().join("work").to_string_lossy(),
+            }),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("extract cancelled"), "{text}");
+        assert!(text.contains("video not found"), "{text}");
     }
 
     #[test]
