@@ -17,6 +17,15 @@ pub fn run_graph(
     mask_package: Option<&Path>,
     output: Option<&Path>,
 ) -> Result<String> {
+    run_graph_controlled(graph_path, mask_package, output, &WriteControl::default())
+}
+
+pub(crate) fn run_graph_controlled(
+    graph_path: &Path,
+    mask_package: Option<&Path>,
+    output: Option<&Path>,
+    control: &WriteControl,
+) -> Result<String> {
     let text = std::fs::read_to_string(graph_path)?;
     let mut graph = RenderGraph::from_json(&text).map_err(|e| HostError::Encode(e.to_string()))?;
     if let Some(out) = output {
@@ -37,7 +46,7 @@ pub fn run_graph(
         let host = SightloomPackageHost::open(dir).map_err(|e| HostError::Encode(e.to_string()))?;
         options = options.with_adapter_host(Arc::new(host));
     }
-    run_render_graph_with(&graph, &WriteControl::default(), &options)
+    run_render_graph_with(&graph, control, &options)
         .map_err(|e| HostError::Encode(e.to_string()))?;
 
     let written = graph

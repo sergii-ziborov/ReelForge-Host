@@ -1,6 +1,64 @@
 # ReelForge Host
 
-One process over the four libraries. **Talk to this MCP, not four.**
+One shared MCP for prompt-driven movie production and existing-media processing.
+
+## Create an animated movie from a prompt
+
+Run the persistent Host (`reelforge-host serve --http`) and open the
+[Studio web app](https://github.com/sergii-ziborov/ReelForge-Studio).
+The movie tools use authenticated Codex CLI for planning and native ImageGen
+for missing visual assets. Host owns the budget, accepted bytes, animation,
+rendering and output checks. No OpenAI API key or image API fallback is used.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"movie_create","arguments":{"id":"space-chase","prompt":"A cyan comet collects three sparks while a violet echo follows its earlier path. A portal opens and the comet escapes. Finish with a short title.","duration":10,"width":1280,"height":720,"fps":24,"max_images":10}}}
+```
+
+The call returns immediately. `movie_inspect` reports progress, current revision,
+the saved Weavatrix Graph, changed/affected nodes and exact asset receipts.
+Weavatrix Memory supplies the checksummed, versioned event store. Native
+ReelForge `SceneDocument`, scene compiler and streaming encoder supply the
+motion and final H.264/AAC file. Studio and its mcport shim forward this same
+Host catalog.
+
+| Tool | Behavior |
+| --- | --- |
+| `movie_create` | Prompt, duration, canvas, fps and per-video image cap; optional named absolute reference paths |
+| `movie_inspect` | Status, saved scene intent, dependencies, receipts, input changes and qualified output URL |
+| `movie_revise` | New prompt plus `base_revision`; verify/reuse unchanged assets and rebuild affected output |
+| `movie_rebuild` | Current `base_revision`; rebuild the saved scene without another planning call |
+| `movie_cancel` | Stop CLI work or cooperatively cancel native export |
+| `movie_resume` | Reopen saved work; recover completed generation before considering another request |
+
+`GET /movies/<id>/video` serves only a completed, checked output with current
+inputs and matching bytes. It supports HEAD and explicit byte ranges, and uses
+the same bearer-token policy as `/mcp`.
+
+Configure `REELFORGE_MOVIES` for persistent projects (default `work/movies`),
+`REELFORGE_CODEX` for the native Codex executable when it is absent from PATH,
+and optionally `REELFORGE_FONT` for native captions. Install FFmpeg/ffprobe and
+authenticate Codex CLI before starting the Host. Windows launches the native
+executable directly without an intermediate shell. Planning runs read-only;
+image roles have separate job workspaces.
+
+Image reservations are committed before launch and remain consumed after an
+unknown outcome. Resume recovers a completed native result without making a
+duplicate request. If an outcome cannot be qualified, production stops with its
+reservation retained. The supported receipt profile correlates Codex exec JSON
+with its local session trace and exactly one native PNG in that thread's output
+directory; it was exercised with Codex CLI 0.154.0 on Windows. An agent saying
+"imagegen" is insufficient evidence. A changed CLI trace contract is rejected.
+`images_already_used` includes earlier attempts in the same video's total cap.
+
+The current profile renders 1–30 second scenes aligned with the requested frame
+clock, using layered 2D scenes with separate moving
+objects, exact delayed followers, computed trails, collection/portal/exit events,
+native captions and synthesized music/cues. At least two visible moving objects
+are required. The output check decodes video/audio and verifies timing, canvas,
+frame variation, event contact and audio levels. Visual storytelling quality
+still requires review; frame variation alone is not proof of good animation.
+Speech synthesis, character articulation and long-form shot production are
+outside this implemented profile.
 
 ```text
   video / photo
@@ -135,8 +193,8 @@ requests as one movie through these same Host methods. Its JSON has `shots`
 `audio` cues contain accepted file `uri`, `gain`, and `start` in seconds.
 `audio_gain` sets the final mix gain. It namespaces each scene graph, concatenates
 shots, mixes cues, saves the executable graph and scene previews, and exports.
-Creative image and speech generation stay with the calling agent; re-rendering
-accepted files makes no provider calls.
+This low-level example expects accepted image/audio files. Automatic prompt
+production uses the persistent `movie_*` tools above.
 
 ```sh
 cargo run --release --example scene_movie -- /path/to/movie.json

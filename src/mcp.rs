@@ -30,6 +30,12 @@ pub const METHODS: &[&str] = &[
     "rewrite_plan",
     "resolve_bridge",
     "compile_scene",
+    "movie_create",
+    "movie_inspect",
+    "movie_revise",
+    "movie_resume",
+    "movie_cancel",
+    "movie_rebuild",
     "run_graph",
     "privacy_except",
     "list_methods",
@@ -301,6 +307,12 @@ pub fn dispatch(svc: &mut HostService, method: &str, args: &Value) -> Result<Val
         "rewrite_plan" => rewrite(args),
         "resolve_bridge" => resolve(svc, args),
         "compile_scene" => crate::scene::compile(args),
+        "movie_create" | "movie_inspect" | "movie_revise" | "movie_resume" | "movie_cancel"
+        | "movie_rebuild" => {
+            let root = std::env::var_os("REELFORGE_MOVIES")
+                .map_or_else(|| svc.work_dir.join("movies"), PathBuf::from);
+            crate::movie::dispatch(&root, method, args)
+        }
         "run_graph" => run(args),
         "privacy_except" => except(svc, args),
         other => Err(HostError::message(format!("unknown host method `{other}`"))),
@@ -309,7 +321,7 @@ pub fn dispatch(svc: &mut HostService, method: &str, args: &Value) -> Result<Val
 
 #[allow(clippy::too_many_lines)]
 fn mcp_tools() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         tool(
             "privacy_except",
             "Killer path: video + photo of the one person to keep sharp. Photo search must Accept or the job fails. Default style is pixelate.",
@@ -438,7 +450,9 @@ fn mcp_tools() -> Vec<Value> {
             "List Host MCP tool names. Intelligence compile_plan is not here.",
             json!({ "type": "object", "properties": {} }),
         ),
-    ]
+    ];
+    tools.extend(crate::movie::tools());
+    tools
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {

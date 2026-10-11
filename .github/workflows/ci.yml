@@ -44,6 +44,18 @@ jobs:
           repository: sergii-ziborov/ReelForge-Capture
           ref: a7edd0f39a3b9acefee869bc95cad5e26ab5749b
           path: ReelForge-Capture
+      - name: checkout graph sibling
+        uses: actions/checkout@v4
+        with:
+          repository: sergii-ziborov/weavatrix-graph
+          ref: 38d034669138e1260e42db0cd3a4200d5977d41a
+          path: weavatrix-graph
+      - name: checkout memory sibling
+        uses: actions/checkout@v4
+        with:
+          repository: sergii-ziborov/weavatrix-memory
+          ref: 905c933ed70c05d3905f309bffee2e2ddcda3209
+          path: weavatrix-memory
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97

@@ -1,0 +1,210 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "title",
+    "synopsis",
+    "assets",
+    "layers",
+    "events"
+  ],
+  "properties": {
+    "title": {
+      "type": "string"
+    },
+    "synopsis": {
+      "type": "string"
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "prompt",
+          "transparent",
+          "reference_ids",
+          "color",
+          "text"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "image",
+              "existing",
+              "text",
+              "glow",
+              "spark",
+              "ring"
+            ]
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "transparent": {
+            "type": "boolean"
+          },
+          "reference_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "color": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "layers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "asset",
+          "role",
+          "width",
+          "order",
+          "path",
+          "follow",
+          "trail_samples"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "asset": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "background",
+              "actor",
+              "prop",
+              "title",
+              "particle"
+            ]
+          },
+          "width": {
+            "type": "number"
+          },
+          "order": {
+            "type": "integer"
+          },
+          "path": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "at",
+                "x",
+                "y",
+                "scale",
+                "rotation",
+                "opacity"
+              ],
+              "properties": {
+                "at": {
+                  "type": "number"
+                },
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                },
+                "scale": {
+                  "type": "number"
+                },
+                "rotation": {
+                  "type": "number"
+                },
+                "opacity": {
+                  "type": "number"
+                }
+              }
+            }
+          },
+          "follow": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "target",
+                  "delay"
+                ],
+                "properties": {
+                  "target": {
+                    "type": "string"
+                  },
+                  "delay": {
+                    "type": "number"
+                  }
+                }
+              }
+            ]
+          },
+          "trail_samples": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "at",
+          "actor",
+          "target"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "collect",
+              "portal_open",
+              "exit"
+            ]
+          },
+          "at": {
+            "type": "number"
+          },
+          "actor": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

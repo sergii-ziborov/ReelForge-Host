@@ -18,6 +18,7 @@ mod http;
 mod lsp;
 mod mcp;
 mod models;
+mod movie;
 mod privacy;
 mod scene;
 mod vision;

@@ -157,6 +157,9 @@ fn serve_one(
         write_http(stream, 200, "application/json", &body)?;
         return Ok(());
     }
+    if ["GET", "HEAD"].contains(&req.method.as_str()) && req.path.starts_with("/movies/") {
+        return serve_movie(stream, &req, token);
+    }
     if req.method != "POST" || (req.path != "/" && req.path != "/mcp") {
         write_http(
             stream,
@@ -193,6 +196,95 @@ fn serve_one(
         Ok(Some(resp)) => write_http(stream, 200, "application/json", &resp.to_string()),
         Err(_) => Err(HostError::message("http worker stopped")),
     }
+}
+
+fn serve_movie(stream: &mut TcpStream, req: &HttpRequest, token: Option<&str>) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    if token.is_some_and(|want| !token_matches(req, want)) {
+        return write_http(
+            stream,
+            401,
+            "application/json",
+            "{\"error\":\"unauthorized\"}",
+        );
+    }
+    let Some(id) = req
+        .path
+        .strip_prefix("/movies/")
+        .and_then(|s| s.strip_suffix("/video"))
+    else {
+        return write_http(
+            stream,
+            404,
+            "application/json",
+            "{\"error\":\"unknown movie route\"}",
+        );
+    };
+    let root = std::env::var_os("REELFORGE_MOVIES").map_or_else(
+        || std::path::PathBuf::from("work/movies"),
+        std::path::PathBuf::from,
+    );
+    let path = match crate::movie::video(&root, id) {
+        Ok(path) => path,
+        Err(e) => {
+            return write_http(
+                stream,
+                404,
+                "application/json",
+                &json!({"error":e.to_string()}).to_string(),
+            );
+        }
+    };
+    let mut file = std::fs::File::open(path)?;
+    let total = file.metadata()?.len();
+    let range = req
+        .headers
+        .iter()
+        .find(|(name, _)| name == "range")
+        .map(|(_, value)| value.as_str());
+    let (start, end) = if let Some(value) = range {
+        let parsed = value
+            .strip_prefix("bytes=")
+            .and_then(|s| s.split_once('-'))
+            .and_then(|(a, b)| {
+                let start = a.parse::<u64>().ok()?;
+                let end = if b.is_empty() {
+                    total.checked_sub(1)?
+                } else {
+                    b.parse::<u64>().ok()?
+                };
+                (start <= end && end < total).then_some((start, end))
+            });
+        let Some(parsed) = parsed else {
+            write!(
+                stream,
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )?;
+            return Ok(());
+        };
+        parsed
+    } else {
+        (0, total.saturating_sub(1))
+    };
+    let length = end - start + 1;
+    let status = if range.is_some() {
+        "206 Partial Content"
+    } else {
+        "200 OK"
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: video/mp4\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: Content-Range, Accept-Ranges\r\nConnection: close\r\n"
+    )?;
+    if range.is_some() {
+        write!(stream, "Content-Range: bytes {start}-{end}/{total}\r\n")?;
+    }
+    write!(stream, "\r\n")?;
+    if req.method != "HEAD" {
+        file.seek(SeekFrom::Start(start))?;
+        std::io::copy(&mut file.take(length), stream)?;
+    }
+    Ok(())
 }
 
 fn bind_host(spec: &str) -> &str {

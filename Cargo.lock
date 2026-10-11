@@ -1342,11 +1342,14 @@ dependencies = [
  "reelforge-intelligence-sightloom",
  "serde",
  "serde_json",
+ "sha2",
  "sightloom",
  "sightloom-host",
  "sightloom-index",
  "tempfile",
  "thiserror",
+ "weavatrix-graph",
+ "weavatrix-memory",
 ]
 
 [[package]]
@@ -2088,6 +2091,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "weavatrix-graph"
+version = "0.6.3"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "weavatrix-memory"
+version = "0.3.3"
+dependencies = [
+ "serde",
+ "weavatrix-graph",
 ]
 
 [[package]]

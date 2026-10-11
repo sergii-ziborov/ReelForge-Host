@@ -22,6 +22,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"
+weavatrix-graph = { path = "../weavatrix-graph" }
+weavatrix-memory = { path = "../weavatrix-memory" }
 reelforge = { path = "../ReelForge/crates/reelforge" }
 reelforge-capture-core = { path = "../ReelForge-Capture/crates/reelforge-capture-core" }
 reelforge-capture-schema = { path = "../ReelForge-Capture/crates/reelforge-capture-schema" }
@@ -35,6 +38,9 @@ sightloom-index = { path = "../SightLoom/crates/sightloom-index", default-featur
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[patch.crates-io]
+weavatrix-graph = { path = "../weavatrix-graph" }
 
 [[bench]]
 name = "host"
