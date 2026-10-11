@@ -29,6 +29,7 @@ pub const METHODS: &[&str] = &[
     "search_photo",
     "rewrite_plan",
     "resolve_bridge",
+    "compile_scene",
     "run_graph",
     "privacy_except",
     "list_methods",
@@ -299,6 +300,7 @@ pub fn dispatch(svc: &mut HostService, method: &str, args: &Value) -> Result<Val
         "search_photo" => search(svc, args),
         "rewrite_plan" => rewrite(args),
         "resolve_bridge" => resolve(svc, args),
+        "compile_scene" => crate::scene::compile(args),
         "run_graph" => run(args),
         "privacy_except" => except(svc, args),
         other => Err(HostError::message(format!("unknown host method `{other}`"))),
@@ -387,6 +389,34 @@ fn mcp_tools() -> Vec<Value> {
                     "subject_id": { "type": "integer" },
                     "output": { "type": "string" },
                     "style": { "type": "string", "enum": ["pixelate", "gaussian", "solid"] }
+                }
+            }),
+        ),
+        tool(
+            "compile_scene",
+            "Compile an editable SceneDocument to the existing posed RenderGraph. Does not open media, generate assets, or encode. Bind the returned graph output before run_graph.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["scene", "media", "canvas"],
+                "properties": {
+                    "scene": { "type": "object", "description": "Versioned SceneDocument with parts and motion channels" },
+                    "media": { "type": "array", "items": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["id", "uri"],
+                        "properties": { "id": { "type": "string" }, "uri": { "type": "string" } }
+                    } },
+                    "canvas": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["width", "height", "duration"],
+                        "properties": {
+                            "width": { "type": "integer", "minimum": 1 },
+                            "height": { "type": "integer", "minimum": 1 },
+                            "duration": { "type": "object", "required": ["ticks", "timescale"],
+                                "properties": { "ticks": { "type": "integer", "minimum": 1 }, "timescale": { "type": "integer", "minimum": 1 } }
+                            }
+                        }
+                    }
                 }
             }),
         ),

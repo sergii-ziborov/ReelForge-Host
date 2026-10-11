@@ -19,6 +19,7 @@ mod lsp;
 mod mcp;
 mod models;
 mod privacy;
+mod scene;
 mod vision;
 
 pub use capture::{

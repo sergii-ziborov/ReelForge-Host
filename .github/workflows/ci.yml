@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/ReelForge
-          ref: 2f48f7c48e2ec29ae6918c7dd2016fd7d2ec2766
+          ref: 6098f854914f65e10c306c22275c0509e240aad3
           path: ReelForge
       - name: checkout SightLoom sibling
         uses: actions/checkout@v4

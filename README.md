@@ -114,10 +114,33 @@ HTTP is the same JSON-RPC as stdio (`POST /mcp` or `POST /`). `GET /health` is a
 | `search_photo` | JPEG/PNG → ranked hits |
 | `rewrite_plan` | FramePick → SubjectIds |
 | `resolve_bridge` | Intelligence freeze + graph JSON |
+| `compile_scene` | Editable SceneDocument + media bindings + canvas → posed RenderGraph |
 | `run_graph` | ReelForge encode |
 | `privacy_except` | all of the above |
 
 Intelligence compiler tools (`compile_plan`, …) are **not** proxied.
+
+`compile_scene` takes `scene` (the existing versioned `SceneDocument`), `media`
+(`[{"id":"picture","uri":"/path/to/accepted.png"}]`), and `canvas`
+(`{"width":1280,"height":720,"duration":{"ticks":72,"timescale":24}}`).
+It returns the posed `graph`, scene id, duration, and visible-part count. It does
+not open media or encode. Set a graph output URI, save the graph, then call
+`run_graph`. Unsupported source masks and invalid scene links are refused by
+the same compiler used by the native project API.
+
+The [`scene_movie` example](examples/scene_movie.rs) renders a saved set of scene
+requests as one movie through these same Host methods. Its JSON has `shots`
+(each a `compile_scene` request), `fps`, and `output`; optional `titles` contain
+`text`, `size`, `font`, and PNG `uri` for native text rasterization, and optional
+`audio` cues contain accepted file `uri`, `gain`, and `start` in seconds.
+`audio_gain` sets the final mix gain. It namespaces each scene graph, concatenates
+shots, mixes cues, saves the executable graph and scene previews, and exports.
+Creative image and speech generation stay with the calling agent; re-rendering
+accepted files makes no provider calls.
+
+```sh
+cargo run --release --example scene_movie -- /path/to/movie.json
+```
 
 **Agents** should call this process (`serve` / `serve --http`), not Intelligence and not a separate “ReelForge-MCP” repo. Editors use `reelforge-host lsp` for the same JSON. Surfaces (egui / Vite / mcport shim) live in [ReelForge-Studio](https://github.com/sergii-ziborov/ReelForge-Studio) and stay public. Variants, money, MCP vs hosted vs LSP: [docs/USE-CASES.md](docs/USE-CASES.md).
 

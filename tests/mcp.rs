@@ -13,6 +13,7 @@ fn methods_include_ingest_photo_run() {
         "search_photo",
         "rewrite_plan",
         "resolve_bridge",
+        "compile_scene",
         "run_graph",
         "privacy_except",
     ] {
@@ -43,6 +44,7 @@ fn jsonrpc_initialize_and_tools_list() {
     assert!(names.contains(&"ingest_video"));
     assert!(names.contains(&"search_photo"));
     assert!(names.contains(&"run_graph"));
+    assert!(names.contains(&"compile_scene"));
     assert!(names.contains(&"privacy_except"));
     let privacy = tools
         .iter()
@@ -66,6 +68,86 @@ fn jsonrpc_initialize_and_tools_list() {
     )
     .unwrap();
     assert_eq!(unknown["error"]["code"], -32601);
+}
+
+fn scene_request() -> serde_json::Value {
+    serde_json::json!({
+        "scene": {
+            "id": "ad-intro", "name": "Intro",
+            "parts": [{
+                "id": "picture", "source": {"media": "accepted-art"},
+                "pivot": {"x": 12.0, "y": 6.0}
+            }],
+            "motion": {"channels": [{
+                "part": "picture", "property": "position_x",
+                "keys": [
+                    {"t": {"ticks": 0, "timescale": 24}, "value": 0.0},
+                    {"t": {"ticks": 72, "timescale": 24}, "value": 120.0}
+                ]
+            }]}
+        },
+        "media": [{"id": "accepted-art", "uri": "not-opened-by-compiler.png"}],
+        "canvas": {"width": 1280, "height": 720,
+            "duration": {"ticks": 72, "timescale": 24}}
+    })
+}
+
+#[test]
+fn scene_compile_through_mcp_preserves_editable_motion_and_declared_hold() {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 17, "method": "tools/call",
+        "params": {"name": "compile_scene", "arguments": scene_request()}
+    });
+    let reply = handle_jsonrpc(&mut HostService::new(), &request.to_string()).unwrap();
+    assert!(reply.get("error").is_none(), "{reply}");
+    let out = &reply["result"]["structuredContent"];
+    assert_eq!(out["scene_id"], "ad-intro");
+    assert_eq!(out["visible_parts"], 1);
+    assert_eq!(out["graph"]["assets"][0]["duration"], out["duration"]);
+    let graph: reelforge::RenderGraph = serde_json::from_value(out["graph"].clone()).unwrap();
+    reelforge::compile_graph(&graph, &reelforge::OperationRegistry::with_builtins()).unwrap();
+    let compose = graph
+        .nodes
+        .iter()
+        .find(|node| {
+            matches!(
+                &node.body, reelforge::RenderNodeKind::Op {operation, ..}
+                    if operation.as_str() == "rf.compose.layers"
+            )
+        })
+        .unwrap();
+    let reelforge::RenderNodeKind::Op { params, .. } = &compose.body else {
+        unreachable!()
+    };
+    assert_eq!(params["layers"][0]["pivot"]["x"], 12.0);
+    assert_eq!(params["layers"][0]["x"]["keys"][1]["value"], 120.0);
+    assert!(graph.outputs[0].uri.is_none());
+}
+
+#[test]
+fn scene_compile_refuses_invalid_documents_and_unimplemented_masks() {
+    for (pointer, value) in [
+        ("/scene/version", serde_json::json!(999)),
+        ("/scene/parts/0/source/media", serde_json::json!("missing")),
+        ("/canvas/width", serde_json::json!(0)),
+        ("/canvas/duration/ticks", serde_json::json!(0)),
+        ("/canvas/duration/timescale", serde_json::json!(0)),
+    ] {
+        let mut args = scene_request();
+        if pointer == "/scene/version" {
+            args["scene"]["version"] = value;
+        } else {
+            *args.pointer_mut(pointer).unwrap() = value;
+        }
+        assert!(
+            dispatch(&mut HostService::new(), "compile_scene", &args).is_err(),
+            "{args}"
+        );
+    }
+    let mut args = scene_request();
+    args["scene"]["parts"][0]["source"]["mask"] = serde_json::json!("not-bound");
+    let err = dispatch(&mut HostService::new(), "compile_scene", &args).unwrap_err();
+    assert!(err.to_string().contains("mask"), "{err}");
 }
 
 #[test]
